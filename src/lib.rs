@@ -133,6 +133,7 @@ impl AudioInfo {
     fn walk_dir(dir: &PathBuf) -> Vec<AudioFile> {
         let mut songs: Vec<AudioFile> = Vec::new();
         for entry in WalkDir::new(dir)
+            .sort_by_file_name()
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|f| {
