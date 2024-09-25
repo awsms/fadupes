@@ -1,23 +1,24 @@
-use audioinfo::AudioInfo;
+use fadupes::AudioFile;
 use clap::{crate_version, value_parser, Arg, ArgAction, Command, ValueHint};
-use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use rayon::prelude::*;
+
 fn main() {
-    let matches = Command::new("AudioInfo Generator")
+    let matches = Command::new("Audio dupechecker")
         .version(crate_version!())
-        .author("Spider")
-        .about("Generates an audioinfo file for the given directory")
+        .author("menfou")
+        .about("Compares audio files in a given directory or multiple inputs and identifies identical files")
         .arg(
             Arg::new("input")
                 .short('i')
                 .long("input")
-                .help("Sets the directory to scan for FLAC files")
+                .help("Sets the directory to scan for audio files")
                 .required(true)
+                .num_args(1..)
                 .value_hint(ValueHint::FilePath)
                 .value_parser(value_parser!(PathBuf)),
         )
-        .arg(Arg::new("output").help("Sets the output directory for audioinfo"))
         .arg(
             Arg::new("verbose")
                 .short('v')
@@ -25,63 +26,88 @@ fn main() {
                 .action(ArgAction::SetTrue)
                 .help("Enables verbose (debug) output"),
         )
-        .arg(
-            Arg::new("print")
-                .short('p')
-                .long("print")
-                .action(ArgAction::SetTrue)
-                .help("Print AudioInfo to std"),
-        )
         .get_matches();
 
-    let output = matches.get_one::<String>("output");
-    let print = matches.get_flag("print");
+    let inputs: Vec<PathBuf> = matches
+        .get_many::<PathBuf>("input")
+        .unwrap()
+        .cloned()
+        .collect();
 
-    let verbose = matches.get_flag("verbose");
-    if verbose {
-        tracing::subscriber::set_global_default(
-            tracing_subscriber::FmtSubscriber::builder()
-                .with_max_level(tracing::Level::DEBUG)
-                .finish(),
-        )
-        .expect("Failed to set global default tracing subscriber");
-    }
-    let path = matches
-        .get_one::<PathBuf>("input")
-        .expect("required")
-        .clone();
-
-    let full_path = match fs::canonicalize(path) {
-        Ok(full_path) => full_path,
-        Err(e) => {
+    // Collect all the audio files from all inputs
+    let audio_files: Vec<AudioFile> = inputs
+    .par_iter() // Process directories in parallel
+    .flat_map(|input| {
+        let full_path = std::fs::canonicalize(input).unwrap_or_else(|e| {
             eprintln!("Error: {}", e);
             std::process::exit(1);
-        }
-    };
+        });
 
-    let audio_info_string = AudioInfo::generate_audio_info_from_path(full_path);
+        // Walk through directory and collect all audio files into a vector
+        let file_map = AudioFile::walk_dir(&full_path);
+        let map = file_map.lock().unwrap(); // Access the locked HashMap
+        map.values() // Access the `Vec<AudioFile>` for each key
+            .flat_map(|files| files.iter()) // Work with references to `AudioFile`
+            .cloned() // If clone is needed, keep this line; otherwise, remove it
+            .collect::<Vec<AudioFile>>() // Collect owned `AudioFile` instances
+    })
+    .collect();
 
-    if print {
-        print!("{:}", audio_info_string);
-    } else {
-        match output {
-            Some(output) => {
-                save_file(output.to_string(), audio_info_string);
-            }
-            None => {
-                save_file(String::from("./audioinfo.txt"), audio_info_string);
-            }
-        }
-    }
+    compare_audio_files(&audio_files);
 }
 
-fn save_file(path: String, audio_info_string: String) {
-    let audioinfo_file_path = Path::new(&path);
-    if let Ok(mut file) = fs::File::create(audioinfo_file_path) {
-        if let Err(e) = file.write_all(audio_info_string.as_bytes()) {
-            eprintln!("Error writing to audioinfo file: {}", e);
+fn compare_audio_files(audio_files: &[AudioFile]) {
+    println!("Comparing {} audio files...", audio_files.len());
+
+    let mut file_map = std::collections::HashMap::new();
+    let log_file_path = "identical_files.log"; // path for the log file (current dir)
+
+    // open the log file in append mode (creates it if not exists), currently it's a simple txt file
+    let mut log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file_path)
+        .expect("Unable to open log file");
+
+    let mut unique_files = Vec::new();
+
+    for file in audio_files {
+        println!("Processing file: {}", file.file_path);
+        println!("CRC32: {}", file.crc32);
+
+        let key = format!(
+            "{}-{}-{}-{}-{}-{}",
+            file.total_samples,
+            file.sample_rate,
+            file.bit_depth,
+            file.channels,
+            file.peak_level,
+            file.rms_db_level
+        );
+
+        file_map.entry(key).or_insert_with(Vec::new).push(file);
+    }
+
+    for (_, files) in &file_map {
+        if files.len() > 1 {
+            println!("The following files are identical:");
+            writeln!(log_file, "#").expect("Failed to write to log file"); // Add separator for each dupes group
+
+            for file in files {
+                println!(" - {}", file.file_path);
+                writeln!(log_file, "{}", file.file_path).expect("Failed to write to log file");
+            }
+        } else {
+            unique_files.push(files[0]);
+        }
+    }
+
+    if !unique_files.is_empty() {
+        println!("The following files are unique:");
+        for file in unique_files {
+            println!(" - {}", file.file_path);
         }
     } else {
-        eprintln!("Error creating audioinfo file");
+        println!("No unique files found.");
     }
 }
