@@ -1,12 +1,14 @@
 use crc32fast::Hasher;
 use hound::WavReader;
-use std::fs::File;
-use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
-use tracing::{info, warn};
-use std::sync::{Arc, Mutex};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tracing::{info, warn};
+use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
 pub struct AudioFile {
@@ -38,11 +40,13 @@ impl Default for AudioFile {
 }
 
 impl AudioFile {
-    // Walk through the directory to find audio files (FLAC and WAV) in parallel
+    // Walk through the directory to find audio files (FLAC and WAV) in parallel with progress bar
     pub fn walk_dir(dir: &PathBuf) -> Arc<Mutex<HashMap<String, Vec<AudioFile>>>> {
         let file_map = Arc::new(Mutex::new(HashMap::new()));
-
-        WalkDir::new(dir)
+        let file_map_clone = Arc::clone(&file_map);
+    
+        // Collect the list of audio files to process
+        let files_to_process: Vec<_> = WalkDir::new(dir)
             .sort_by_file_name()
             .into_iter()
             .filter_map(|e| e.ok())
@@ -53,35 +57,84 @@ impl AudioFile {
                     false
                 }
             })
-            .par_bridge()
-            .filter_map(|entry| {
-                info!("Processing file: {:?}", entry.path());
-                match Self::process_audio_file(&entry) {
-                    Ok(audio_file) => Some(audio_file),
-                    Err(err) => {
-                        warn!("Error processing file {:?}: {}", entry.path(), err);
-                        None
+            .collect();
+    
+        let total_files = files_to_process.len();
+        let multi_progress = MultiProgress::new(); // MultiProgress to handle multiple progress bars
+    
+        // General progress bar for all files
+        let general_progress_bar = multi_progress.add(ProgressBar::new(total_files as u64));
+        general_progress_bar.set_style(
+            ProgressStyle::with_template("Total Progress: [{wide_bar}] {pos}/{len} ({eta})")
+                .expect("Failed to create general progress bar template")
+                .progress_chars("#>-"),
+        );
+    
+        // Process each file in parallel, showing individual progress bars for each
+        let _ = std::thread::spawn(move || {
+            files_to_process
+                .par_iter()
+                .map(|entry| {
+                    let path_str = entry.path().to_string_lossy().to_string();
+    
+                    // Create an individual progress bar for each file with 100 steps
+                    let file_progress_bar = multi_progress.add(ProgressBar::new(100)); // For each file, we use a "100 steps" progress bar
+                    file_progress_bar.set_style(
+                        ProgressStyle::with_template("{msg}\n[{wide_bar}] {pos}%")
+                            .expect("Failed to create file progress bar template")
+                            .progress_chars("█░"),
+                    );
+    
+                    // Set the message to the current filename
+                    file_progress_bar.set_message(format!("Processing: {}", path_str));
+    
+                    // Simulate file processing with incremental progress
+                    for _ in 0..100 {
+                        std::thread::sleep(Duration::from_millis(10)); // Simulate work for a small chunk of the file
+                        file_progress_bar.inc(1); // Increment progress by 1%
                     }
-                }
-            })
-            .for_each(|audio_file| {
-                let file_stem = Path::new(&audio_file.file_name)
-                    .file_stem()
-                    .map(|stem| stem.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "unknown".to_string()); // Handle None safely
-
-                let mut map = file_map.lock().unwrap();
-                map.entry(file_stem)
-                    .or_insert_with(Vec::new)
-                    .push(audio_file);
-            });
-
+    
+                    match AudioFile::process_audio_file(entry) {
+                        Ok(audio_file) => {
+                            file_progress_bar.finish_and_clear(); // Clear the progress bar once done
+                            Some(audio_file)
+                        }
+                        Err(err) => {
+                            file_progress_bar.finish_and_clear(); // Clear even if it failed
+                            None
+                        }
+                    }
+                })
+                .for_each(|audio_file| {
+                    if let Some(file) = audio_file {
+                        let file_stem = Path::new(&file.file_name)
+                            .file_stem()
+                            .map(|stem| stem.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+    
+                        let mut map = file_map_clone.lock().unwrap();
+                        map.entry(file_stem).or_insert_with(Vec::new).push(file);
+                    }
+    
+                    // Increment the general progress bar after each file is processed
+                    general_progress_bar.inc(1);
+                });
+    
+            general_progress_bar.finish_with_message("All files processed");
+        })
+        .join()
+        .expect("Thread failed");
+    
         file_map
-    } 
+    }    
 
     // Process individual audio files (FLAC and WAV)
     pub fn process_audio_file(entry: &walkdir::DirEntry) -> Result<AudioFile, ProcessError> {
-        let extension = entry.path().extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        let extension = entry
+            .path()
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
         let mut audio_file = AudioFile {
             file_path: entry.path().to_string_lossy().to_string(), // Store the full path
             ..Default::default()
@@ -97,13 +150,17 @@ impl AudioFile {
                 audio_file.bit_depth = stream_info.bits_per_sample;
                 audio_file.channels = stream_info.channels;
 
-                let samples: Vec<i16> = reader.samples().map(|sample| sample.unwrap_or(0) as i16).collect();
+                let samples: Vec<i16> = reader
+                    .samples()
+                    .map(|sample| sample.unwrap_or(0) as i16)
+                    .collect();
                 audio_file.crc32 = Self::generate_crc32_16bit(&samples);
                 audio_file.peak_level = Self::calculate_peak_level_16bit(&samples);
                 audio_file.rms_db_level = Self::calculate_rms_db_level(samples, 16);
             }
             "wav" => {
-                let mut reader = WavReader::open(entry.path()).map_err(|_| ProcessError::NonFlacError)?;
+                let mut reader =
+                    WavReader::open(entry.path()).map_err(|_| ProcessError::NonFlacError)?;
                 let spec = reader.spec();
                 audio_file.total_samples = reader.duration() as u64;
                 audio_file.sample_rate = spec.sample_rate;
@@ -127,10 +184,13 @@ impl AudioFile {
         }
 
         let max_amplitude = Self::get_max_amplitude(bit_depth) as f64;
-        let squared_sum: f64 = samples.iter().map(|sample| {
-            let normalized_sample = *sample as f64 / max_amplitude;
-            normalized_sample * normalized_sample
-        }).sum();
+        let squared_sum: f64 = samples
+            .iter()
+            .map(|sample| {
+                let normalized_sample = *sample as f64 / max_amplitude;
+                normalized_sample * normalized_sample
+            })
+            .sum();
 
         let rms_amplitude = (squared_sum / samples.len() as f64).sqrt();
         20.0 * rms_amplitude.log10()
