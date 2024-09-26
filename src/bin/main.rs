@@ -3,6 +3,7 @@ use clap::{crate_version, value_parser, Arg, ArgAction, Command, ValueHint};
 use std::io::Write;
 use std::path::PathBuf;
 use rayon::prelude::*;
+use std::collections::HashMap;
 
 fn main() {
     let matches = Command::new("Audio dupechecker")
@@ -57,24 +58,11 @@ fn main() {
 }
 
 fn compare_audio_files(audio_files: &[AudioFile]) {
-    println!("Comparing {} audio files...", audio_files.len());
+    let mut file_map = HashMap::new();
+    let mut identical_groups = Vec::new();
 
-    let mut file_map = std::collections::HashMap::new();
-    let log_file_path = "identical_files.log"; // path for the log file (current dir)
-
-    // open the log file in append mode (creates it if not exists), currently it's a simple txt file
-    let mut log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file_path)
-        .expect("Unable to open log file");
-
-    let mut unique_files = Vec::new();
-
+    // Group files by their characteristics
     for file in audio_files {
-        println!("Processing file: {}", file.file_path);
-        println!("CRC32: {}", file.crc32);
-
         let key = format!(
             "{}-{}-{}-{}-{}-{}",
             file.total_samples,
@@ -88,26 +76,25 @@ fn compare_audio_files(audio_files: &[AudioFile]) {
         file_map.entry(key).or_insert_with(Vec::new).push(file);
     }
 
+    // Collect identical files into groups
     for (_, files) in &file_map {
         if files.len() > 1 {
-            println!("The following files are identical:");
-            writeln!(log_file, "#").expect("Failed to write to log file"); // Add separator for each dupes group
-
-            for file in files {
-                println!(" - {}", file.file_path);
-                writeln!(log_file, "{}", file.file_path).expect("Failed to write to log file");
-            }
-        } else {
-            unique_files.push(files[0]);
+            identical_groups.push(files);
         }
     }
 
-    if !unique_files.is_empty() {
-        println!("The following files are unique:");
-        for file in unique_files {
-            println!(" - {}", file.file_path);
-        }
+    // Output the results
+    if identical_groups.is_empty() {
+        println!("Among {} files, no dupes were found.", audio_files.len());
     } else {
-        println!("No unique files found.");
+        let total_dupes: usize = identical_groups.iter().map(|g| g.len()).sum();
+        println!("Found {} identical files:", total_dupes);
+
+        for group in identical_groups {
+            for file in group {
+                println!("{}", file.file_path);
+            }
+            println!(); // Add an empty line between dupe groups
+        }
     }
 }
