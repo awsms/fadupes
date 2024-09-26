@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{info, warn};
 use walkdir::WalkDir;
+use std::io::Read; 
 
 #[derive(Debug, Clone)]
 pub struct AudioFile {
@@ -77,10 +78,13 @@ impl AudioFile {
                 .map(|entry| {
                     let path_str = entry.path().to_string_lossy().to_string();
     
-                    // Create an individual progress bar for each file with 100 steps
-                    let file_progress_bar = multi_progress.add(ProgressBar::new(100)); // For each file, we use a "100 steps" progress bar
+                    // Get the file size in bytes
+                    let file_size = std::fs::metadata(entry.path()).map(|metadata| metadata.len()).unwrap_or(0);
+    
+                    // Create an individual progress bar for each file based on its size in bytes
+                    let file_progress_bar = multi_progress.add(ProgressBar::new(file_size));
                     file_progress_bar.set_style(
-                        ProgressStyle::with_template("{msg}\n[{wide_bar}] {pos}%")
+                        ProgressStyle::with_template("{msg}\n[{wide_bar}] {bytes}/{total_bytes} ({eta})")
                             .expect("Failed to create file progress bar template")
                             .progress_chars("█░"),
                     );
@@ -88,34 +92,45 @@ impl AudioFile {
                     // Set the message to the current filename
                     file_progress_bar.set_message(format!("Processing: {}", path_str));
     
-                    // Simulate file processing with incremental progress
-                    for _ in 0..100 {
-                        std::thread::sleep(Duration::from_millis(10)); // Simulate work for a small chunk of the file
-                        file_progress_bar.inc(1); // Increment progress by 1%
+                    // Simulate or perform real byte-based processing, incrementing the progress bar
+                    let mut file = std::fs::File::open(entry.path()).expect("Failed to open file");
+                    let mut buffer = [0u8; 8192]; // Read 8 KB chunks
+    
+                    let mut bytes_processed = 0;
+                    while let Ok(bytes_read) = file.read(&mut buffer) {
+                        if bytes_read == 0 {
+                            break; // End of file
+                        }
+                        bytes_processed += bytes_read as u64;
+                        file_progress_bar.set_position(bytes_processed); // Update progress based on bytes read
                     }
     
+                    file_progress_bar.finish_and_clear(); // Clear the progress bar once done
+    
+                    // Process the audio file and collect its metadata
                     match AudioFile::process_audio_file(entry) {
                         Ok(audio_file) => {
-                            file_progress_bar.finish_and_clear(); // Clear the progress bar once done
+                            // Clone the `audio_file` before adding it to the map
+                            let audio_file_clone = audio_file.clone();
+    
+                            // Add processed file to the map
+                            let file_stem = Path::new(&audio_file.file_name)
+                                .file_stem()
+                                .map(|stem| stem.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "unknown".to_string());
+    
+                            let mut map = file_map_clone.lock().unwrap();
+                            map.entry(file_stem).or_insert_with(Vec::new).push(audio_file_clone);
+    
                             Some(audio_file)
                         }
                         Err(err) => {
-                            file_progress_bar.finish_and_clear(); // Clear even if it failed
+                            println!("Error processing file: {}: {:?}", path_str, err);
                             None
                         }
                     }
                 })
-                .for_each(|audio_file| {
-                    if let Some(file) = audio_file {
-                        let file_stem = Path::new(&file.file_name)
-                            .file_stem()
-                            .map(|stem| stem.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "unknown".to_string());
-    
-                        let mut map = file_map_clone.lock().unwrap();
-                        map.entry(file_stem).or_insert_with(Vec::new).push(file);
-                    }
-    
+                .for_each(|_| {
                     // Increment the general progress bar after each file is processed
                     general_progress_bar.inc(1);
                 });
@@ -126,8 +141,9 @@ impl AudioFile {
         .expect("Thread failed");
     
         file_map
-    }    
-
+    }
+    
+    
     // Process individual audio files (FLAC and WAV)
     pub fn process_audio_file(entry: &walkdir::DirEntry) -> Result<AudioFile, ProcessError> {
         let extension = entry
