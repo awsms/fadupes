@@ -1,9 +1,9 @@
-use fadupes::AudioFile;
 use clap::{crate_version, value_parser, Arg, ArgAction, Command, ValueHint};
+use fadupes::AudioFile;
+use rayon::prelude::*;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
-use rayon::prelude::*;
-use std::collections::HashMap;
 
 fn main() {
     let matches = Command::new("Audio dupechecker")
@@ -35,29 +35,41 @@ fn main() {
         .cloned()
         .collect();
 
+    // Create a HashSet of scanned directories to pass to the walk_dir function
+    let scanned_dirs: HashSet<PathBuf> = inputs.iter().cloned().collect();
+
     // Collect all the audio files from all inputs
     let audio_files: Vec<AudioFile> = inputs
-    .par_iter() // Process directories in parallel
-    .flat_map(|input| {
-        let full_path = std::fs::canonicalize(input).unwrap_or_else(|e| {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        });
+        .par_iter() // Process directories in parallel
+        .flat_map(|input| {
+            let full_path = std::fs::canonicalize(input).unwrap_or_else(|e| {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            });
 
-        // Walk through directory and collect all audio files into a vector
-        let file_map = AudioFile::walk_dir(&full_path);
-        let map = file_map.lock().unwrap(); // Access the locked HashMap
-        map.values() // Access the `Vec<AudioFile>` for each key
-            .flat_map(|files| files.iter()) // Work with references to `AudioFile`
-            .cloned() // If clone is needed, keep this line; otherwise, remove it
-            .collect::<Vec<AudioFile>>() // Collect owned `AudioFile` instances
-    })
-    .collect();
+            // Walk through directory and collect all audio files into a vector
+            let file_map = AudioFile::walk_dir(&full_path, &scanned_dirs);
+            let map = file_map.lock().unwrap(); // Access the locked HashMap
+            map.values() // Access the `Vec<AudioFile>` for each key
+                .flat_map(|files| files.iter()) // Work with references to `AudioFile`
+                .cloned() // If clone is needed, keep this line; otherwise, remove it
+                .collect::<Vec<AudioFile>>() // Collect owned `AudioFile` instances
+        })
+        .collect();
 
     compare_audio_files(&audio_files);
 }
 
 fn compare_audio_files(audio_files: &[AudioFile]) {
+    let log_file_path = "identical_files.log"; // path for the log file (current dir)
+
+    // Open the log file in append mode (creates it if not exists), currently it's a simple txt file
+    let mut log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file_path)
+        .expect("Unable to open log file");
+
     let mut file_map = HashMap::new();
     let mut identical_groups = Vec::new();
 
@@ -83,16 +95,19 @@ fn compare_audio_files(audio_files: &[AudioFile]) {
         }
     }
 
-    // Output the results
+    // Output the results and write to the log file
     if identical_groups.is_empty() {
         println!("Among {} files, no dupes were found.", audio_files.len());
     } else {
         let total_dupes: usize = identical_groups.iter().map(|g| g.len()).sum();
         println!("Found {} identical files:", total_dupes);
 
+        writeln!(log_file, "Identical Files Found:").expect("Failed to write to log file");
         for group in identical_groups {
+            writeln!(log_file, "#").expect("Failed to write to log file"); // Add separator for each dupe group
             for file in group {
                 println!("{}", file.file_path);
+                writeln!(log_file, "{}", file.file_path).expect("Failed to write to log file");
             }
             println!(); // Add an empty line between dupe groups
         }
