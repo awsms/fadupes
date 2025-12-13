@@ -1,7 +1,7 @@
 use hound::WavReader;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::read_link;
 use std::fs::File;
 use std::io::Write; // New import to handle writing to log files
@@ -40,16 +40,13 @@ impl Default for AudioFile {
 
 impl AudioFile {
     // Walk through the directory to find audio files (FLAC and WAV) in parallel with progress bar
-    pub fn walk_dir(dir: &PathBuf, scanned_dirs: &HashSet<PathBuf>) -> Vec<AudioFile> {
-        // Create or open the error log file
-        let log_error_path = "identical_files_errors.log"; // Path for the error log file
-        let error_log_file = Arc::new(Mutex::new(
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_error_path)
-                .expect("Unable to open error log file"),
-        ));
+    pub fn walk_dir(
+        dir: &PathBuf,
+        scanned_dirs: &HashSet<PathBuf>,
+        verbose: bool,
+    ) -> Vec<AudioFile> {
+        // Lazily create the error log file on first error
+        let error_log_file: Arc<Mutex<Option<File>>> = Arc::new(Mutex::new(None));
 
         // Collect the list of audio files to process
         let files_to_process: Vec<_> = WalkDir::new(dir)
@@ -57,7 +54,7 @@ impl AudioFile {
             .sort_by_file_name()
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|f| {
+            .filter_map(|f| {
                 let path = f.path();
 
                 // Check if it's a symlink and resolve it
@@ -68,21 +65,33 @@ impl AudioFile {
                             "Skipping symlink pointing to a scanned dir: {}",
                             path.display()
                         );
-                        return false;
+                        return None;
                     }
                 }
 
                 // Filter by file extension (flac or wav) and file size
-                if let Some(extension) = f.path().extension() {
-                    (extension == "flac" || extension == "wav")
-                        && std::fs::metadata(f.path())
-                            .map(|meta| meta.len() <= 300 * 1024 * 1024) // Check if file is <= 300MB
-                            .unwrap_or(false)
+                let Some(extension) = f.path().extension() else {
+                    return None;
+                };
+
+                let size_ok = std::fs::metadata(f.path())
+                    .map(|meta| meta.len() <= 300 * 1024 * 1024) // Check if file is <= 300MB
+                    .unwrap_or(false);
+
+                if (extension == "flac" || extension == "wav") && size_ok {
+                    let size = std::fs::metadata(f.path()).map(|m| m.len()).unwrap_or(0);
+                    Some((f, size))
                 } else {
-                    false
+                    None
                 }
             })
             .collect();
+
+        // Prefilter: count how many times each file size appears
+        let mut size_counts: HashMap<u64, usize> = HashMap::new();
+        for (_, size) in &files_to_process {
+            *size_counts.entry(*size).or_insert(0) += 1;
+        }
 
         let total_files = files_to_process.len();
 
@@ -95,9 +104,23 @@ impl AudioFile {
 
         let audio_files: Vec<AudioFile> = files_to_process
             .par_iter()
-            .filter_map(|entry| {
+            .filter_map(|(entry, size)| {
                 let path_str = entry.path().to_string_lossy().to_string();
                 let progress = progress_bar.clone();
+                let skip_decode = size_counts.get(size).copied().unwrap_or(0) <= 1;
+
+                if verbose {
+                    if skip_decode {
+                        println!("Skipping unique-size file: {}", path_str);
+                    } else {
+                        println!("Processing: {}", path_str);
+                    }
+                }
+
+                if skip_decode {
+                    progress.inc(1);
+                    return None;
+                }
 
                 let result = match AudioFile::process_audio_file(entry) {
                     Ok(audio_file) => Some(audio_file),
@@ -106,8 +129,19 @@ impl AudioFile {
                             format!("Error processing file: {}: {:?}", path_str, err);
                         println!("{}", error_message);
                         let mut error_log = error_log_file.lock().unwrap();
-                        writeln!(error_log, "{}", error_message)
-                            .expect("Failed to write to error log file");
+                        if error_log.is_none() {
+                            *error_log = Some(
+                                std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open("identical_files_errors.log")
+                                    .expect("Unable to open error log file"),
+                            );
+                        }
+                        if let Some(file) = error_log.as_mut() {
+                            writeln!(file, "{}", error_message)
+                                .expect("Failed to write to error log file");
+                        }
                         None
                     }
                 };

@@ -34,6 +34,7 @@ fn main() {
         .unwrap()
         .cloned()
         .collect();
+    let verbose = matches.get_flag("verbose");
 
     // Create a HashSet of scanned directories to pass to the walk_dir function
     let scanned_dirs: HashSet<PathBuf> = inputs.iter().cloned().collect();
@@ -47,7 +48,7 @@ fn main() {
                 std::process::exit(1);
             });
 
-            AudioFile::walk_dir(&full_path, &scanned_dirs).into_par_iter()
+            AudioFile::walk_dir(&full_path, &scanned_dirs, verbose).into_par_iter()
         })
         .collect();
 
