@@ -1,17 +1,17 @@
 [package]
 name = "fadupes"
-version = "1.0.1"
-edition = "2021"
+version = "1.0.2"
+edition = "2024"
 
 [dependencies]
 walkdir = "2.5.0"
-crc32fast = "1.4.2"
+crc32fast = "1.5.0"
 claxon = "0.4.3"
-tracing = "0.1.40"
-clap = {version = "4.5.18", features = ["cargo"]}
+tracing = "0.1.43"
+clap = {version = "4.5.53", features = ["cargo"]}
 hound = "3.5.1"
-rayon = "1.10.0"
-indicatif = "0.17.8"
+rayon = "1.11.0"
+indicatif = "0.18.3"
 
 [[bin]]
 name = "fadupes"
