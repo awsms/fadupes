@@ -1,12 +1,14 @@
 use hound::WavReader;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::read_link;
 use std::fs::File;
 use std::io::Write; // New import to handle writing to log files
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -43,7 +45,8 @@ impl AudioFile {
     pub fn walk_dir(
         dir: &PathBuf,
         scanned_dirs: &HashSet<PathBuf>,
-        verbose: bool,
+        list_files: bool,
+        skip_unique_size: bool,
     ) -> Vec<AudioFile> {
         // Lazily create the error log file on first error
         let error_log_file: Arc<Mutex<Option<File>>> = Arc::new(Mutex::new(None));
@@ -87,69 +90,167 @@ impl AudioFile {
             })
             .collect();
 
-        // Prefilter: count how many times each file size appears
-        let mut size_counts: HashMap<u64, usize> = HashMap::new();
-        for (_, size) in &files_to_process {
-            *size_counts.entry(*size).or_insert(0) += 1;
-        }
-
         let total_files = files_to_process.len();
 
-        let progress_bar = ProgressBar::new(total_files as u64);
-        progress_bar.set_style(
-            ProgressStyle::with_template("Total Progress: [{wide_bar}] {pos}/{len} ({eta})")
-                .expect("Failed to create general progress bar template")
-                .progress_chars("#>-"),
-        );
+        let (progress_bar, list_mp) = if list_files {
+            let mp = Arc::new(MultiProgress::new());
+            let total_pb = mp.add(ProgressBar::new(total_files as u64));
+            total_pb.set_style(
+                ProgressStyle::with_template("Total Progress: [{wide_bar}] {pos}/{len} ({eta})")
+                    .expect("Failed to create general progress bar template")
+                    .progress_chars("#>-"),
+            );
+            (total_pb, Some(mp))
+        } else {
+            let pb = ProgressBar::new(total_files as u64);
+            pb.set_style(
+                ProgressStyle::with_template("Total Progress: [{wide_bar}] {pos}/{len} ({eta})")
+                    .expect("Failed to create general progress bar template")
+                    .progress_chars("#>-"),
+            );
+            (pb, None)
+        };
 
-        let audio_files: Vec<AudioFile> = files_to_process
-            .par_iter()
-            .filter_map(|(entry, size)| {
-                let path_str = entry.path().to_string_lossy().to_string();
-                let progress = progress_bar.clone();
-                let skip_decode = size_counts.get(size).copied().unwrap_or(0) <= 1;
-
-                if verbose {
-                    if skip_decode {
-                        println!("Skipping unique-size file: {}", path_str);
-                    } else {
-                        println!("Processing: {}", path_str);
-                    }
+        let audio_files: Vec<AudioFile> = if list_files {
+            let start_counter = Arc::new(AtomicUsize::new(0));
+            let size_counts = if skip_unique_size {
+                let mut counts = std::collections::HashMap::new();
+                for (_, size) in &files_to_process {
+                    *counts.entry(*size).or_insert(0usize) += 1;
                 }
+                Some(counts)
+            } else {
+                None
+            };
 
-                if skip_decode {
+            files_to_process
+                .par_iter()
+                .filter_map(|(entry, size)| {
+                    let path_str = entry.path().to_string_lossy().to_string();
+                    let progress = progress_bar.clone();
+
+                    if skip_unique_size
+                        && size_counts
+                            .as_ref()
+                            .and_then(|map| map.get(size))
+                            .copied()
+                            .unwrap_or(0)
+                            <= 1
+                    {
+                        if let Some(ref mp) = list_mp {
+                            let _ = mp.println(format!(
+                                "Skipping unique-size file: {}",
+                                entry.path().display()
+                            ));
+                        }
+                        progress.inc(1);
+                        return None;
+                    }
+
+                    let start_order = start_counter.fetch_add(1, Ordering::Relaxed) + 1;
+                    let per_file_pb = list_mp.as_ref().map(|mp| {
+                        let pb = mp.add(ProgressBar::new_spinner());
+                        pb.set_style(
+                            ProgressStyle::with_template("{spinner} {msg}")
+                                .expect("Failed to create file progress bar template")
+                                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+                        );
+                        pb.enable_steady_tick(Duration::from_millis(100));
+                        pb.set_message(format!("[{}/{}] {}", start_order, total_files, path_str));
+                        pb
+                    });
+
+                    let result = match AudioFile::process_audio_file(entry) {
+                        Ok(audio_file) => Some(audio_file),
+                        Err(err) => {
+                            let error_message =
+                                format!("Error processing file: {}: {:?}", path_str, err);
+                            println!("{}", error_message);
+                            let mut error_log = error_log_file.lock().unwrap();
+                            if error_log.is_none() {
+                                *error_log = Some(
+                                    std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open("identical_files_errors.log")
+                                        .expect("Unable to open error log file"),
+                                );
+                            }
+                            if let Some(file) = error_log.as_mut() {
+                                writeln!(file, "{}", error_message)
+                                    .expect("Failed to write to error log file");
+                            }
+                            None
+                        }
+                    };
+
                     progress.inc(1);
-                    return None;
-                }
 
-                let result = match AudioFile::process_audio_file(entry) {
-                    Ok(audio_file) => Some(audio_file),
-                    Err(err) => {
-                        let error_message =
-                            format!("Error processing file: {}: {:?}", path_str, err);
-                        println!("{}", error_message);
-                        let mut error_log = error_log_file.lock().unwrap();
-                        if error_log.is_none() {
-                            *error_log = Some(
-                                std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open("identical_files_errors.log")
-                                    .expect("Unable to open error log file"),
-                            );
-                        }
-                        if let Some(file) = error_log.as_mut() {
-                            writeln!(file, "{}", error_message)
-                                .expect("Failed to write to error log file");
-                        }
-                        None
+                    if let Some(pb) = per_file_pb {
+                        pb.finish_and_clear();
                     }
-                };
 
-                progress.inc(1);
-                result
-            })
-            .collect();
+                    result
+                })
+                .collect()
+        } else {
+            let size_counts = if skip_unique_size {
+                let mut counts = std::collections::HashMap::new();
+                for (_, size) in &files_to_process {
+                    *counts.entry(*size).or_insert(0usize) += 1;
+                }
+                Some(counts)
+            } else {
+                None
+            };
+
+            files_to_process
+                .par_iter()
+                .filter_map(|(entry, size)| {
+                    let path_str = entry.path().to_string_lossy().to_string();
+                    let progress = progress_bar.clone();
+
+                    if skip_unique_size
+                        && size_counts
+                            .as_ref()
+                            .and_then(|map| map.get(size))
+                            .copied()
+                            .unwrap_or(0)
+                            <= 1
+                    {
+                        progress.inc(1);
+                        return None;
+                    }
+
+                    let result = match AudioFile::process_audio_file(entry) {
+                        Ok(audio_file) => Some(audio_file),
+                        Err(err) => {
+                            let error_message =
+                                format!("Error processing file: {}: {:?}", path_str, err);
+                            println!("{}", error_message);
+                            let mut error_log = error_log_file.lock().unwrap();
+                            if error_log.is_none() {
+                                *error_log = Some(
+                                    std::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open("identical_files_errors.log")
+                                        .expect("Unable to open error log file"),
+                                );
+                            }
+                            if let Some(file) = error_log.as_mut() {
+                                writeln!(file, "{}", error_message)
+                                    .expect("Failed to write to error log file");
+                            }
+                            None
+                        }
+                    };
+
+                    progress.inc(1);
+                    result
+                })
+                .collect()
+        };
 
         progress_bar.finish_with_message("All files processed");
         audio_files

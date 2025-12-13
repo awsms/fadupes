@@ -21,11 +21,16 @@ fn main() {
                 .value_parser(value_parser!(PathBuf)),
         )
         .arg(
-            Arg::new("verbose")
-                .short('v')
-                .long("verbose")
+            Arg::new("skip_unique_size")
+                .long("skip-unique-size")
                 .action(ArgAction::SetTrue)
-                .help("Enables verbose (debug) output"),
+                .help("Skip files whose byte size is unique (faster, but may miss dupes)"),
+        )
+        .arg(
+            Arg::new("nolist")
+                .long("nolist")
+                .action(ArgAction::SetTrue)
+                .help("Disable showing the file list as files are scanned"),
         )
         .get_matches();
 
@@ -34,7 +39,8 @@ fn main() {
         .unwrap()
         .cloned()
         .collect();
-    let verbose = matches.get_flag("verbose");
+    let list_files = !matches.get_flag("nolist");
+    let skip_unique_size = matches.get_flag("skip_unique_size");
 
     // Create a HashSet of scanned directories to pass to the walk_dir function
     let scanned_dirs: HashSet<PathBuf> = inputs.iter().cloned().collect();
@@ -48,7 +54,8 @@ fn main() {
                 std::process::exit(1);
             });
 
-            AudioFile::walk_dir(&full_path, &scanned_dirs, verbose).into_par_iter()
+            AudioFile::walk_dir(&full_path, &scanned_dirs, list_files, skip_unique_size)
+                .into_par_iter()
         })
         .collect();
 
