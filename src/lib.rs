@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::io::Write; // New import to handle writing to log files
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -47,6 +48,16 @@ impl AudioFile {
     ) -> Arc<Mutex<HashMap<String, Vec<AudioFile>>>> {
         let file_map = Arc::new(Mutex::new(HashMap::new()));
         let file_map_clone = Arc::clone(&file_map);
+
+        // Create or open the error log file
+        let log_error_path = "identical_files_errors.log"; // Path for the error log file
+        let error_log_file = Arc::new(Mutex::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_error_path)
+                .expect("Unable to open error log file"),
+        ));
 
         // Collect the list of audio files to process
         let files_to_process: Vec<_> = WalkDir::new(dir)
@@ -152,7 +163,12 @@ impl AudioFile {
                             Some(audio_file)
                         }
                         Err(err) => {
-                            println!("Error processing file: {}: {:?}", path_str, err);
+                            let error_message = format!("Error processing file: {}: {:?}", path_str, err);
+                            println!("{}", error_message);
+                            // Log the error to the log file using Arc<Mutex<File>>
+                            let mut error_log = error_log_file.lock().unwrap();
+                            writeln!(error_log, "{}", error_message)
+                                .expect("Failed to write to error log file");
                             None
                         }
                     }
