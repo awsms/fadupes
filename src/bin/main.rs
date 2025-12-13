@@ -40,20 +40,14 @@ fn main() {
 
     // Collect all the audio files from all inputs
     let audio_files: Vec<AudioFile> = inputs
-        .par_iter() // Process directories in parallel
+        .into_par_iter() // Process directories in parallel
         .flat_map(|input| {
-            let full_path = std::fs::canonicalize(input).unwrap_or_else(|e| {
+            let full_path = std::fs::canonicalize(&input).unwrap_or_else(|e| {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             });
 
-            // Walk through directory and collect all audio files into a vector
-            let file_map = AudioFile::walk_dir(&full_path, &scanned_dirs);
-            let map = file_map.lock().unwrap(); // Access the locked HashMap
-            map.values() // Access the `Vec<AudioFile>` for each key
-                .flat_map(|files| files.iter()) // Work with references to `AudioFile`
-                .cloned() // If clone is needed, keep this line; otherwise, remove it
-                .collect::<Vec<AudioFile>>() // Collect owned `AudioFile` instances
+            AudioFile::walk_dir(&full_path, &scanned_dirs).into_par_iter()
         })
         .collect();
 
@@ -75,14 +69,13 @@ fn compare_audio_files(audio_files: &[AudioFile]) {
 
     // Group files by their characteristics
     for file in audio_files {
-        let key = format!(
-            "{}-{}-{}-{}-{}-{}",
+        let key = (
             file.total_samples,
             file.sample_rate,
             file.bit_depth,
             file.channels,
-            file.peak_level,
-            file.rms_db_level
+            file.peak_level.to_bits(),
+            file.rms_db_level.to_bits(),
         );
 
         file_map.entry(key).or_insert_with(Vec::new).push(file);

@@ -1,14 +1,12 @@
-use crc32fast::Hasher;
 use hound::WavReader;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::read_link;
 use std::fs::File;
-use std::io::Read;
+use std::io::Write; // New import to handle writing to log files
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::io::Write; // New import to handle writing to log files
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone)]
@@ -42,13 +40,7 @@ impl Default for AudioFile {
 
 impl AudioFile {
     // Walk through the directory to find audio files (FLAC and WAV) in parallel with progress bar
-    pub fn walk_dir(
-        dir: &PathBuf,
-        scanned_dirs: &HashSet<PathBuf>,
-    ) -> Arc<Mutex<HashMap<String, Vec<AudioFile>>>> {
-        let file_map = Arc::new(Mutex::new(HashMap::new()));
-        let file_map_clone = Arc::clone(&file_map);
-
+    pub fn walk_dir(dir: &PathBuf, scanned_dirs: &HashSet<PathBuf>) -> Vec<AudioFile> {
         // Create or open the error log file
         let log_error_path = "identical_files_errors.log"; // Path for the error log file
         let error_log_file = Arc::new(Mutex::new(
@@ -93,97 +85,40 @@ impl AudioFile {
             .collect();
 
         let total_files = files_to_process.len();
-        let multi_progress = MultiProgress::new(); // MultiProgress to handle multiple progress bars
 
-        // General progress bar for all files
-        let general_progress_bar = multi_progress.add(ProgressBar::new(total_files as u64));
-        general_progress_bar.set_style(
+        let progress_bar = ProgressBar::new(total_files as u64);
+        progress_bar.set_style(
             ProgressStyle::with_template("Total Progress: [{wide_bar}] {pos}/{len} ({eta})")
                 .expect("Failed to create general progress bar template")
                 .progress_chars("#>-"),
         );
 
-        // Process each file in parallel, showing individual progress bars for each
-        let _ = std::thread::spawn(move || {
-            files_to_process
-                .par_iter()
-                .map(|entry| {
-                    let path_str = entry.path().to_string_lossy().to_string();
+        let audio_files: Vec<AudioFile> = files_to_process
+            .par_iter()
+            .filter_map(|entry| {
+                let path_str = entry.path().to_string_lossy().to_string();
+                let progress = progress_bar.clone();
 
-                    // Get the file size in bytes
-                    let file_size = std::fs::metadata(entry.path())
-                        .map(|metadata| metadata.len())
-                        .unwrap_or(0);
-
-                    // Create an individual progress bar for each file based on its size in bytes
-                    let file_progress_bar = multi_progress.add(ProgressBar::new(file_size));
-                    file_progress_bar.set_style(
-                        ProgressStyle::with_template(
-                            "{msg}\n[{wide_bar}] {bytes}/{total_bytes} ({eta})",
-                        )
-                        .expect("Failed to create file progress bar template")
-                        .progress_chars("█░"),
-                    );
-
-                    // Set the message to the current filename
-                    file_progress_bar.set_message(format!("Processing: {}", path_str));
-
-                    // Simulate or perform real byte-based processing, incrementing the progress bar
-                    let mut file = std::fs::File::open(entry.path()).expect("Failed to open file");
-                    let mut buffer = [0u8; 8192]; // Read 8 KB chunks
-
-                    let mut bytes_processed = 0;
-                    while let Ok(bytes_read) = file.read(&mut buffer) {
-                        if bytes_read == 0 {
-                            break; // End of file
-                        }
-                        bytes_processed += bytes_read as u64;
-                        file_progress_bar.set_position(bytes_processed); // Update progress based on bytes read
+                let result = match AudioFile::process_audio_file(entry) {
+                    Ok(audio_file) => Some(audio_file),
+                    Err(err) => {
+                        let error_message =
+                            format!("Error processing file: {}: {:?}", path_str, err);
+                        println!("{}", error_message);
+                        let mut error_log = error_log_file.lock().unwrap();
+                        writeln!(error_log, "{}", error_message)
+                            .expect("Failed to write to error log file");
+                        None
                     }
+                };
 
-                    file_progress_bar.finish_and_clear(); // Clear the progress bar once done
+                progress.inc(1);
+                result
+            })
+            .collect();
 
-                    // Process the audio file and collect its metadata
-                    match AudioFile::process_audio_file(entry) {
-                        Ok(audio_file) => {
-                            // Clone the `audio_file` before adding it to the map
-                            let audio_file_clone = audio_file.clone();
-
-                            // Add processed file to the map
-                            let file_stem = Path::new(&audio_file.file_name)
-                                .file_stem()
-                                .map(|stem| stem.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "unknown".to_string());
-
-                            let mut map = file_map_clone.lock().unwrap();
-                            map.entry(file_stem)
-                                .or_insert_with(Vec::new)
-                                .push(audio_file_clone);
-
-                            Some(audio_file)
-                        }
-                        Err(err) => {
-                            let error_message = format!("Error processing file: {}: {:?}", path_str, err);
-                            println!("{}", error_message);
-                            // Log the error to the log file using Arc<Mutex<File>>
-                            let mut error_log = error_log_file.lock().unwrap();
-                            writeln!(error_log, "{}", error_message)
-                                .expect("Failed to write to error log file");
-                            None
-                        }
-                    }
-                })
-                .for_each(|_| {
-                    // Increment the general progress bar after each file is processed
-                    general_progress_bar.inc(1);
-                });
-
-            general_progress_bar.finish_with_message("All files processed");
-        })
-        .join()
-        .expect("Thread failed");
-
-        file_map
+        progress_bar.finish_with_message("All files processed");
+        audio_files
     }
 
     // Process individual audio files (FLAC and WAV)
@@ -208,13 +143,12 @@ impl AudioFile {
                 audio_file.bit_depth = stream_info.bits_per_sample;
                 audio_file.channels = stream_info.channels;
 
-                let samples: Vec<i16> = reader
-                    .samples()
-                    .map(|sample| sample.unwrap_or(0) as i16)
-                    .collect();
-                audio_file.crc32 = Self::generate_crc32_16bit(&samples);
-                audio_file.peak_level = Self::calculate_peak_level_16bit(&samples);
-                audio_file.rms_db_level = Self::calculate_rms_db_level(samples, 16);
+                let (peak_level, rms_db_level) = Self::accumulate_metrics(
+                    reader.samples().map(|sample| sample.unwrap_or(0) as i16),
+                    stream_info.bits_per_sample as i32,
+                );
+                audio_file.peak_level = peak_level;
+                audio_file.rms_db_level = rms_db_level;
             }
             "wav" => {
                 let mut reader =
@@ -225,10 +159,12 @@ impl AudioFile {
                 audio_file.bit_depth = spec.bits_per_sample as u32;
                 audio_file.channels = spec.channels as u32;
 
-                let samples: Vec<i16> = reader.samples::<i16>().map(|s| s.unwrap_or(0)).collect();
-                audio_file.crc32 = Self::generate_crc32_16bit(&samples);
-                audio_file.peak_level = Self::calculate_peak_level_16bit(&samples);
-                audio_file.rms_db_level = Self::calculate_rms_db_level(samples, 16);
+                let (peak_level, rms_db_level) = Self::accumulate_metrics(
+                    reader.samples::<i16>().map(|s| s.unwrap_or(0)),
+                    spec.bits_per_sample as i32,
+                );
+                audio_file.peak_level = peak_level;
+                audio_file.rms_db_level = rms_db_level;
             }
             _ => return Err(ProcessError::UnsupportedBitDepth),
         }
@@ -236,35 +172,40 @@ impl AudioFile {
         Ok(audio_file)
     }
 
-    fn calculate_rms_db_level(samples: Vec<i16>, bit_depth: i32) -> f64 {
-        if samples.is_empty() {
-            return f64::NEG_INFINITY;
-        }
-
+    fn accumulate_metrics<I>(samples: I, bit_depth: i32) -> (f32, f64)
+    where
+        I: Iterator<Item = i16>,
+    {
         let max_amplitude = Self::get_max_amplitude(bit_depth) as f64;
-        let squared_sum: f64 = samples
-            .iter()
-            .map(|sample| {
-                let normalized_sample = *sample as f64 / max_amplitude;
-                normalized_sample * normalized_sample
-            })
-            .sum();
+        let mut max_abs = 0i32;
+        let mut squared_sum = 0f64;
+        let mut count = 0u64;
 
-        let rms_amplitude = (squared_sum / samples.len() as f64).sqrt();
-        20.0 * rms_amplitude.log10()
-    }
-
-    fn calculate_peak_level_16bit(samples: &[i16]) -> f32 {
-        let max_amplitude = samples.iter().map(|sample| sample.abs()).max().unwrap_or(0);
-        max_amplitude as f32 / i16::MAX as f32
-    }
-
-    fn generate_crc32_16bit(samples: &[i16]) -> String {
-        let mut crc32 = Hasher::new();
         for sample in samples {
-            crc32.update(&sample.to_le_bytes());
+            let abs = sample.abs() as i32;
+            if abs > max_abs {
+                max_abs = abs;
+            }
+
+            let normalized = sample as f64 / max_amplitude;
+            squared_sum += normalized * normalized;
+            count += 1;
         }
-        format!("{:08X}", crc32.finalize())
+
+        let peak_level = if max_abs == 0 {
+            0.0
+        } else {
+            max_abs as f32 / i16::MAX as f32
+        };
+
+        let rms_db_level = if count == 0 {
+            f64::NEG_INFINITY
+        } else {
+            let rms_amplitude = (squared_sum / count as f64).sqrt();
+            20.0 * rms_amplitude.log10()
+        };
+
+        (peak_level, rms_db_level)
     }
 
     fn get_max_amplitude(bit_depth: i32) -> i32 {
