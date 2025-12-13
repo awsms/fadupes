@@ -1,4 +1,4 @@
-use clap::{crate_version, value_parser, Arg, ArgAction, Command, ValueHint};
+use clap::{Arg, ArgAction, Command, ValueHint, crate_version, value_parser};
 use fadupes::AudioFile;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};

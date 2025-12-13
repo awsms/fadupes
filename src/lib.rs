@@ -2,8 +2,8 @@ use hound::WavReader;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::collections::HashSet;
-use std::fs::read_link;
 use std::fs::File;
+use std::fs::read_link;
 use std::io::Write; // New import to handle writing to log files
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -113,6 +113,24 @@ impl AudioFile {
 
         let audio_files: Vec<AudioFile> = if list_files {
             let start_counter = Arc::new(AtomicUsize::new(0));
+            let max_bars = std::cmp::max(1, std::cmp::min(rayon::current_num_threads(), 8));
+            let list_bars: Arc<Vec<ProgressBar>> = Arc::new(
+                (0..max_bars)
+                    .map(|_| {
+                        let pb = list_mp
+                            .as_ref()
+                            .expect("list_mp must exist when list_files is true")
+                            .add(ProgressBar::new_spinner());
+                        pb.set_style(
+                            ProgressStyle::with_template("{spinner} {msg}")
+                                .expect("Failed to create file progress bar template")
+                                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+                        );
+                        pb.enable_steady_tick(Duration::from_millis(100));
+                        pb
+                    })
+                    .collect(),
+            );
             let size_counts = if skip_unique_size {
                 let mut counts = std::collections::HashMap::new();
                 for (_, size) in &files_to_process {
@@ -148,17 +166,13 @@ impl AudioFile {
                     }
 
                     let start_order = start_counter.fetch_add(1, Ordering::Relaxed) + 1;
-                    let per_file_pb = list_mp.as_ref().map(|mp| {
-                        let pb = mp.add(ProgressBar::new_spinner());
-                        pb.set_style(
-                            ProgressStyle::with_template("{spinner} {msg}")
-                                .expect("Failed to create file progress bar template")
-                                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-                        );
-                        pb.enable_steady_tick(Duration::from_millis(100));
+                    let per_file_pb = {
+                        let bars = Arc::clone(&list_bars);
+                        let slot = (start_order - 1) % max_bars;
+                        let pb = &bars[slot];
                         pb.set_message(format!("[{}/{}] {}", start_order, total_files, path_str));
-                        pb
-                    });
+                        Some(pb.clone())
+                    };
 
                     let result = match AudioFile::process_audio_file(entry) {
                         Ok(audio_file) => Some(audio_file),
@@ -187,7 +201,7 @@ impl AudioFile {
                     progress.inc(1);
 
                     if let Some(pb) = per_file_pb {
-                        pb.finish_and_clear();
+                        pb.set_message(String::new());
                     }
 
                     result
