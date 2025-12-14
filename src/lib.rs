@@ -135,7 +135,6 @@ pub struct AudioFile {
         deserialize_with = "deserialize_rms_db_level"
     )]
     pub rms_db_level: f64,
-    pub crc32: String,
     pub file_size: u64,
     pub modified_secs: u64,
 }
@@ -151,7 +150,6 @@ impl Default for AudioFile {
             channels: 0,
             peak_level: 0.0,
             rms_db_level: 0.0,
-            crc32: String::default(),
             file_size: 0,
             modified_secs: 0,
         }
