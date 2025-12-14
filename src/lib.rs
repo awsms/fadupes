@@ -281,6 +281,28 @@ impl Drop for ResumeCache {
 }
 
 impl AudioFile {
+    // Shared helper: decide if an entry should be skipped (unique size) or served from cache.
+    fn skip_or_cached(
+        entry: &walkdir::DirEntry,
+        size: u64,
+        modified_secs: u64,
+        skip_unique_size: bool,
+        size_counts: Option<&HashMap<u64, usize>>,
+        resume_cache: Option<&Arc<ResumeCache>>,
+    ) -> (bool, Option<AudioFile>) {
+        let is_unique_skip = skip_unique_size
+            && size_counts
+                .and_then(|map| map.get(&size))
+                .copied()
+                .unwrap_or(0)
+                <= 1;
+
+        let cached = resume_cache
+            .and_then(|cache| cache.lookup(entry.path(), size, modified_secs));
+
+        (is_unique_skip, cached)
+    }
+
     // Walk through the directory to find audio files (FLAC and WAV) in parallel with progress bar
     pub fn walk_dir(
         dir: &PathBuf,
@@ -370,20 +392,16 @@ impl AudioFile {
         let initial_processed = files_to_process
             .iter()
             .filter(|(entry, size, modified_secs)| {
-                let is_unique_skip = skip_unique_size
-                    && size_counts
-                        .as_ref()
-                        .and_then(|map| map.get(size))
-                        .copied()
-                        .unwrap_or(0)
-                        <= 1;
+                let (is_unique_skip, cached) = Self::skip_or_cached(
+                    entry,
+                    *size,
+                    *modified_secs,
+                    skip_unique_size,
+                    size_counts.as_ref(),
+                    resume_cache.as_ref(),
+                );
 
-                let cache_hit = resume_cache
-                    .as_ref()
-                    .and_then(|cache| cache.lookup(entry.path(), *size, *modified_secs))
-                    .is_some();
-
-                is_unique_skip || cache_hit
+                is_unique_skip || cached.is_some()
             })
             .count();
 
@@ -437,16 +455,14 @@ impl AudioFile {
                     let path_str = entry.path().to_string_lossy().to_string();
                     let progress = progress_bar.clone();
 
-                    let is_unique_skip = skip_unique_size
-                        && size_counts
-                            .as_ref()
-                            .and_then(|map| map.get(size))
-                            .copied()
-                            .unwrap_or(0)
-                            <= 1;
-                    let cached = resume_cache
-                        .as_ref()
-                        .and_then(|cache| cache.lookup(entry.path(), *size, *modified_secs));
+                    let (is_unique_skip, cached) = Self::skip_or_cached(
+                        entry,
+                        *size,
+                        *modified_secs,
+                        skip_unique_size,
+                        size_counts.as_ref(),
+                        resume_cache.as_ref(),
+                    );
                     let already_processed = is_unique_skip || cached.is_some();
 
                     if is_unique_skip {
@@ -530,16 +546,14 @@ impl AudioFile {
                     let path_str = entry.path().to_string_lossy().to_string();
                     let progress = progress_bar.clone();
 
-                    let is_unique_skip = skip_unique_size
-                        && size_counts
-                            .as_ref()
-                            .and_then(|map| map.get(size))
-                            .copied()
-                            .unwrap_or(0)
-                            <= 1;
-                    let cached = resume_cache
-                        .as_ref()
-                        .and_then(|cache| cache.lookup(entry.path(), *size, *modified_secs));
+                    let (is_unique_skip, cached) = Self::skip_or_cached(
+                        entry,
+                        *size,
+                        *modified_secs,
+                        skip_unique_size,
+                        size_counts.as_ref(),
+                        resume_cache.as_ref(),
+                    );
                     let already_processed = is_unique_skip || cached.is_some();
 
                     if is_unique_skip {
