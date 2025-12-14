@@ -1,6 +1,6 @@
 use clap::{Arg, ArgAction, Command, ValueHint, crate_version, value_parser};
 use ctrlc;
-use fadupes::{AudioFile, ResumeCache, parse_size_filter, SizeFilter};
+use fadupes::{AudioFile, ResumeCache, SizeFilter, parse_size_filter};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -79,9 +79,7 @@ fn main() {
             eprintln!("--ignore-size parse error: {e}");
             std::process::exit(2);
         });
-    let provided_state_file = matches
-        .get_one::<PathBuf>("state_file")
-        .cloned();
+    let provided_state_file = matches.get_one::<PathBuf>("state_file").cloned();
     let resume_enabled = !no_resume;
     let state_file = provided_state_file.unwrap_or_else(|| PathBuf::from("fadupes_state.json"));
     let resume_cache = if resume_enabled {

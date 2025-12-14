@@ -297,6 +297,8 @@ impl AudioFile {
         let error_log_file: Arc<Mutex<Option<File>>> = Arc::new(Mutex::new(None));
 
         // Collect the list of audio files to process
+        // Build the full candidate list up front; we need it to compute unique-size skips
+        // and to seed the progress bar with already-cached or skipped entries on resume.
         let files_to_process: Vec<_> = WalkDir::new(dir)
             .follow_links(!ignore_symlinks) // Follow symlinks by default; skip loop-back symlinks into input roots (and skip all symlinks if --nosym is set)
             .sort_by_file_name()
@@ -355,6 +357,38 @@ impl AudioFile {
             })
             .collect();
 
+        // Precompute size counts if we need to skip unique sizes
+        let size_counts = if skip_unique_size {
+            let mut counts = std::collections::HashMap::new();
+            for (_, size, _) in &files_to_process {
+                *counts.entry(*size).or_insert(0usize) += 1;
+            }
+            Some(counts)
+        } else {
+            None
+        };
+
+        // Count how many entries are already satisfied (cached) or will be skipped (unique size)
+        let initial_processed = files_to_process
+            .iter()
+            .filter(|(entry, size, modified_secs)| {
+                let is_unique_skip = skip_unique_size
+                    && size_counts
+                        .as_ref()
+                        .and_then(|map| map.get(size))
+                        .copied()
+                        .unwrap_or(0)
+                        <= 1;
+
+                let cache_hit = resume_cache
+                    .as_ref()
+                    .and_then(|cache| cache.lookup(entry.path(), *size, *modified_secs))
+                    .is_some();
+
+                is_unique_skip || cache_hit
+            })
+            .count();
+
         let total_files = files_to_process.len();
 
         let (progress_bar, list_mp) = if list_files {
@@ -375,9 +409,11 @@ impl AudioFile {
             );
             (pb, None)
         };
+        // Seed the progress bar with pre-accounted work so resume shows correct totals.
+        progress_bar.set_position(initial_processed as u64);
 
         let audio_files: Vec<AudioFile> = if list_files {
-            let start_counter = Arc::new(AtomicUsize::new(0));
+            let start_counter = Arc::new(AtomicUsize::new(initial_processed));
             // Limiti UI noise, cap to <= 8 spinner lines and reuse them by assigning files round-robin to a "slot"
             let max_bars = std::cmp::max(1, std::cmp::min(rayon::current_num_threads(), 8));
             let list_bars: Arc<Vec<ProgressBar>> = Arc::new(
@@ -397,53 +433,45 @@ impl AudioFile {
                     })
                     .collect(),
             );
-            // Fast-path: if a byte-size occurs only once, skip processing it (faster, but may miss dupes depending on strategy)
-            let size_counts = if skip_unique_size {
-                let mut counts = std::collections::HashMap::new();
-                for (_, size, _) in &files_to_process {
-                    *counts.entry(*size).or_insert(0usize) += 1;
-                }
-                Some(counts)
-            } else {
-                None
-            };
-
             files_to_process
                 .par_iter()
                 .filter_map(|(entry, size, modified_secs)| {
                     let path_str = entry.path().to_string_lossy().to_string();
                     let progress = progress_bar.clone();
 
-                    if skip_unique_size
+                    let is_unique_skip = skip_unique_size
                         && size_counts
                             .as_ref()
                             .and_then(|map| map.get(size))
                             .copied()
                             .unwrap_or(0)
-                            <= 1
-                    {
+                            <= 1;
+                    let cached = resume_cache
+                        .as_ref()
+                        .and_then(|cache| cache.lookup(entry.path(), *size, *modified_secs));
+                    let already_processed = is_unique_skip || cached.is_some();
+
+                    if is_unique_skip {
                         if let Some(ref mp) = list_mp {
                             let _ = mp.println(format!(
                                 "Skipping unique-size file: {}",
                                 entry.path().display()
                             ));
                         }
-                        progress.inc(1);
                         return None;
                     }
 
-                    if let Some(cache) = resume_cache.as_ref() {
-                        if let Some(audio_file) = cache.lookup(entry.path(), *size, *modified_secs)
-                        {
-                            if let Some(ref mp) = list_mp {
-                                let _ = mp.println(format!(
-                                    "Using cached result for: {}",
-                                    entry.path().display()
-                                ));
-                            }
-                            progress.inc(1);
-                            return Some(audio_file);
+                    if let Some(audio_file) = cached {
+                        if let Some(ref mp) = list_mp {
+                            let _ = mp.println(format!(
+                                "Using cached result for: {}",
+                                entry.path().display()
+                            ));
                         }
+                        if !already_processed {
+                            progress.inc(1);
+                        }
+                        return Some(audio_file);
                     }
 
                     let start_order = start_counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -486,7 +514,9 @@ impl AudioFile {
                         }
                     };
 
-                    progress.inc(1);
+                    if !already_processed {
+                        progress.inc(1);
+                    }
 
                     if let Some(pb) = per_file_pb {
                         pb.set_message(String::new());
@@ -496,40 +526,33 @@ impl AudioFile {
                 })
                 .collect()
         } else {
-            let size_counts = if skip_unique_size {
-                let mut counts = std::collections::HashMap::new();
-                for (_, size, _) in &files_to_process {
-                    *counts.entry(*size).or_insert(0usize) += 1;
-                }
-                Some(counts)
-            } else {
-                None
-            };
-
             files_to_process
                 .par_iter()
                 .filter_map(|(entry, size, modified_secs)| {
                     let path_str = entry.path().to_string_lossy().to_string();
                     let progress = progress_bar.clone();
 
-                    if skip_unique_size
+                    let is_unique_skip = skip_unique_size
                         && size_counts
                             .as_ref()
                             .and_then(|map| map.get(size))
                             .copied()
                             .unwrap_or(0)
-                            <= 1
-                    {
-                        progress.inc(1);
+                            <= 1;
+                    let cached = resume_cache
+                        .as_ref()
+                        .and_then(|cache| cache.lookup(entry.path(), *size, *modified_secs));
+                    let already_processed = is_unique_skip || cached.is_some();
+
+                    if is_unique_skip {
                         return None;
                     }
 
-                    if let Some(cache) = resume_cache.as_ref() {
-                        if let Some(audio_file) = cache.lookup(entry.path(), *size, *modified_secs)
-                        {
+                    if let Some(audio_file) = cached {
+                        if !already_processed {
                             progress.inc(1);
-                            return Some(audio_file);
                         }
+                        return Some(audio_file);
                     }
 
                     let result = match AudioFile::process_audio_file(entry) {
@@ -563,7 +586,9 @@ impl AudioFile {
                         }
                     };
 
-                    progress.inc(1);
+                    if !already_processed {
+                        progress.inc(1);
+                    }
                     result
                 })
                 .collect()
