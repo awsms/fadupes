@@ -79,6 +79,7 @@ impl ResumeCache {
         &self.path
     }
 
+    // Cache entry is valid only if size + modified time match (cheap change detector)
     pub fn lookup(&self, file_path: &Path, file_size: u64, modified_secs: u64) -> Option<AudioFile> {
         let map = self.data.lock().ok()?;
         map.get(&file_path.to_string_lossy().to_string())
@@ -103,6 +104,7 @@ impl ResumeCache {
             );
         }
 
+        // Throttle disk writes: save cache every 'save_every' inserts (AtomicUsize so threads coordinate cheaply)
         let count = self.pending.fetch_add(1, Ordering::Relaxed) + 1;
         if count == 1 || count % self.save_every == 0 {
             let _ = self.save();
@@ -121,6 +123,7 @@ impl ResumeCache {
             }
         }
 
+        // Atomic-ish save: write to a temp file then rename, so we don't leave a half-written JSON behind
         let tmp_path = self.path.with_extension("tmp");
         let file = File::create(&tmp_path)?;
         serde_json::to_writer_pretty(file, &snapshot)?;
@@ -145,12 +148,12 @@ impl AudioFile {
         ignore_symlinks: bool,
         resume_cache: Option<Arc<ResumeCache>>,
     ) -> Vec<AudioFile> {
-        // Lazily create the error log file on first error
+        // Lazily open the error log only if we hit an error (shared across threads via Mutex<Option<File>>)
         let error_log_file: Arc<Mutex<Option<File>>> = Arc::new(Mutex::new(None));
 
         // Collect the list of audio files to process
         let files_to_process: Vec<_> = WalkDir::new(dir)
-            .follow_links(!ignore_symlinks) // Enable following symlinks unless disabled
+            .follow_links(!ignore_symlinks) // Follow symlinks by default; skip loop-back symlinks into input roots (and skip all symlinks if --nosym is set).
             .sort_by_file_name()
             .into_iter()
             .filter_map(|e| e.ok())
@@ -184,7 +187,7 @@ impl AudioFile {
                     return None;
                 };
 
-                let size_ok = metadata.len() <= 300 * 1024 * 1024; // Check if file is <= 300MB
+                let size_ok = metadata.len() <= 800 * 1024 * 1024; // Check if file is <= 800MB
 
                 if (extension == "flac" || extension == "wav") && size_ok {
                     let size = metadata.len();
@@ -224,6 +227,7 @@ impl AudioFile {
 
         let audio_files: Vec<AudioFile> = if list_files {
             let start_counter = Arc::new(AtomicUsize::new(0));
+            // Limiti UI noise, cap to <= 8 spinner lines and reuse them by assigning files round-robin to a "slot"
             let max_bars = std::cmp::max(1, std::cmp::min(rayon::current_num_threads(), 8));
             let list_bars: Arc<Vec<ProgressBar>> = Arc::new(
                 (0..max_bars)
@@ -242,6 +246,7 @@ impl AudioFile {
                     })
                     .collect(),
             );
+            // Fast-path: if a byte-size occurs only once, skip processing it (faster, but may miss dupes depending on strategy)
             let size_counts = if skip_unique_size {
                 let mut counts = std::collections::HashMap::new();
                 for (_, size, _) in &files_to_process {
@@ -474,6 +479,7 @@ impl AudioFile {
         Ok(audio_file)
     }
 
+    // Single-pass over samples: compute peak + RMS(dB). Empty input => -inf dB to avoid log10(0)
     fn accumulate_metrics<I>(samples: I, bit_depth: i32) -> (f32, f64)
     where
         I: Iterator<Item = i16>,

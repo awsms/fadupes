@@ -75,6 +75,7 @@ fn main() {
         None
     };
 
+    // If resume is enabled, trap Ctrl+C so we can persist the cache before exiting (130 = SIGINT)
     if let Some(cache) = resume_cache.as_ref() {
         let cache_for_signal = Arc::clone(cache);
         ctrlc::set_handler(move || {
@@ -130,6 +131,7 @@ fn compare_audio_files(audio_files: &[AudioFile]) {
 
     // Group files by their characteristics
     for file in audio_files {
+        // Use bitwise float representation so grouping is exact
         let key = (
             file.total_samples,
             file.sample_rate,
@@ -157,6 +159,7 @@ fn compare_audio_files(audio_files: &[AudioFile]) {
         println!("Found {} identical files:", total_dupes);
 
         writeln!(log_file, "Identical Files Found:").expect("Failed to write to log file");
+        // Avoid logging the same dupe-group more than once in a single run (stable signature = sorted paths)
         let mut seen_groups: HashSet<Vec<String>> = HashSet::new();
 
         for group in identical_groups {
