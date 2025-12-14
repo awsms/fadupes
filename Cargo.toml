@@ -1,6 +1,6 @@
 [package]
 name = "fadupes"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 
 [dependencies]
@@ -12,8 +12,8 @@ clap = {version = "4.5.53", features = ["cargo"]}
 hound = "3.5.1"
 rayon = "1.11.0"
 indicatif = "0.18.3"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 ctrlc = "3"
 
 [[bin]]

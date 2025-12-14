@@ -15,6 +15,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+
+          awk -v ver="$ver" '
+            $0 ~ "^## \\[" ver "\\]" { found=1; print; next }
+            found && $0 ~ "^## \\["  { exit }
+            found                    { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+
+          sed -i ':a;/^[[:space:]]*$/{$d;N;ba}' RELEASE_NOTES.md
+
+          test -s RELEASE_NOTES.md || { echo "No CHANGELOG section found for $ver"; exit 1; }
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -30,6 +46,7 @@ jobs:
       - name: Upload release assets
         uses: softprops/action-gh-release@v1
         with:
+          body_path: RELEASE_NOTES.md
           files: |
             target/release/fadupes
             target/release/fadupes.sha256
