@@ -32,6 +32,12 @@ fn main() {
                 .action(ArgAction::SetTrue)
                 .help("Disable showing the file list as files are scanned"),
         )
+        .arg(
+            Arg::new("nosym")
+                .long("nosym")
+                .action(ArgAction::SetTrue)
+                .help("Ignore symlinks instead of following them"),
+        )
         .get_matches();
 
     let inputs: Vec<PathBuf> = matches
@@ -41,6 +47,7 @@ fn main() {
         .collect();
     let list_files = !matches.get_flag("nolist");
     let skip_unique_size = matches.get_flag("skip_unique_size");
+    let ignore_symlinks = matches.get_flag("nosym");
 
     // Create a HashSet of scanned directories to pass to the walk_dir function
     let scanned_dirs: HashSet<PathBuf> = inputs.iter().cloned().collect();
@@ -54,8 +61,14 @@ fn main() {
                 std::process::exit(1);
             });
 
-            AudioFile::walk_dir(&full_path, &scanned_dirs, list_files, skip_unique_size)
-                .into_par_iter()
+            AudioFile::walk_dir(
+                &full_path,
+                &scanned_dirs,
+                list_files,
+                skip_unique_size,
+                ignore_symlinks,
+            )
+            .into_par_iter()
         })
         .collect();
 

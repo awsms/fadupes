@@ -47,28 +47,35 @@ impl AudioFile {
         scanned_dirs: &HashSet<PathBuf>,
         list_files: bool,
         skip_unique_size: bool,
+        ignore_symlinks: bool,
     ) -> Vec<AudioFile> {
         // Lazily create the error log file on first error
         let error_log_file: Arc<Mutex<Option<File>>> = Arc::new(Mutex::new(None));
 
         // Collect the list of audio files to process
         let files_to_process: Vec<_> = WalkDir::new(dir)
-            .follow_links(true) // Enable following symlinks
+            .follow_links(!ignore_symlinks) // Enable following symlinks unless disabled
             .sort_by_file_name()
             .into_iter()
             .filter_map(|e| e.ok())
             .filter_map(|f| {
                 let path = f.path();
 
-                // Check if it's a symlink and resolve it
-                if let Ok(symlink_target) = read_link(path) {
-                    // If symlink points to one of the directories being scanned, ignore it
-                    if scanned_dirs.contains(&symlink_target) {
-                        eprintln!(
-                            "Skipping symlink pointing to a scanned dir: {}",
-                            path.display()
-                        );
+                if f.file_type().is_symlink() {
+                    if ignore_symlinks {
                         return None;
+                    }
+
+                    // Check if it's a symlink and resolve it
+                    if let Ok(symlink_target) = read_link(path) {
+                        // If symlink points to one of the directories being scanned, ignore it
+                        if scanned_dirs.contains(&symlink_target) {
+                            eprintln!(
+                                "Skipping symlink pointing to a scanned dir: {}",
+                                path.display()
+                            );
+                            return None;
+                        }
                     }
                 }
 
