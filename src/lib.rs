@@ -12,6 +12,85 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 use walkdir::WalkDir;
 
+#[derive(Clone, Debug)]
+pub enum SizeFilter {
+    Lt(u64),
+    Gt(u64),
+    Range(u64, u64), // inclusive
+}
+
+impl SizeFilter {
+    pub fn should_ignore(&self, bytes: u64) -> bool {
+        match *self {
+            SizeFilter::Lt(n) => bytes < n,
+            SizeFilter::Gt(n) => bytes > n,
+            SizeFilter::Range(a, b) => bytes >= a && bytes <= b,
+        }
+    }
+}
+
+pub fn parse_size_filter(s: &str) -> Result<SizeFilter, String> {
+    let s = s.trim();
+
+    // range: "3MB..800MB"
+    if let Some((a, b)) = s.split_once("..") {
+        let a = parse_size_bytes(a.trim())?;
+        let b = parse_size_bytes(b.trim())?;
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        return Ok(SizeFilter::Range(lo, hi));
+    }
+
+    // "<3MB" or ">800MB"
+    let (op, rest) = s.split_at(1);
+    let n = parse_size_bytes(rest.trim())?;
+    match op {
+        "<" => Ok(SizeFilter::Lt(n)),
+        ">" => Ok(SizeFilter::Gt(n)),
+        _ => Err(
+            "expected '<', '>', or '..' range (examples: \"<3MB\", \">800MB\", \"3MB..800MB\")"
+                .into(),
+        ),
+    }
+}
+
+fn parse_size_bytes(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+
+    // Split into number + suffix
+    let mut i = 0usize;
+    for (idx, ch) in s.char_indices() {
+        if ch.is_ascii_digit() || ch == '.' {
+            i = idx + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if i == 0 {
+        return Err(format!("missing number in \"{s}\""));
+    }
+
+    let num_str = &s[..i];
+    let unit_str = s[i..].trim().to_ascii_lowercase();
+
+    let value: f64 = num_str
+        .parse()
+        .map_err(|_| format!("bad number \"{num_str}\""))?;
+
+    let mult: f64 = match unit_str.as_str() {
+        "" | "b" => 1.0,
+        "kb" | "k" => 1024.0,
+        "mb" | "m" => 1024.0 * 1024.0,
+        "gb" | "g" => 1024.0 * 1024.0 * 1024.0,
+        _ => return Err(format!("unknown unit \"{unit_str}\" (use B/KB/MB/GB)")),
+    };
+
+    let bytes = value * mult;
+    if !bytes.is_finite() || bytes < 0.0 {
+        return Err(format!("invalid size \"{s}\""));
+    }
+    Ok(bytes.round() as u64)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioFile {
     pub file_path: String,
@@ -147,6 +226,7 @@ impl AudioFile {
         skip_unique_size: bool,
         ignore_symlinks: bool,
         resume_cache: Option<Arc<ResumeCache>>,
+        ignore_size: Option<&SizeFilter>,
     ) -> Vec<AudioFile> {
         // Lazily open the error log only if we hit an error (shared across threads via Mutex<Option<File>>)
         let error_log_file: Arc<Mutex<Option<File>>> = Arc::new(Mutex::new(None));
@@ -182,12 +262,18 @@ impl AudioFile {
                     return None;
                 };
 
+                let size = metadata.len();
+                // Apply optional ignore filter from --ignore-size
+                if ignore_size.is_some_and(|flt| flt.should_ignore(size)) {
+                    return None;
+                }
+
+                let size_ok = metadata.len() <= 800 * 1024 * 1024; // Check if file is <= 800MB
+
                 // Filter by file extension (flac or wav) and file size
                 let Some(extension) = f.path().extension() else {
                     return None;
                 };
-
-                let size_ok = metadata.len() <= 800 * 1024 * 1024; // Check if file is <= 800MB
 
                 if (extension == "flac" || extension == "wav") && size_ok {
                     let size = metadata.len();

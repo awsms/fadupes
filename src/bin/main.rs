@@ -1,6 +1,6 @@
 use clap::{Arg, ArgAction, Command, ValueHint, crate_version, value_parser};
 use ctrlc;
-use fadupes::{AudioFile, ResumeCache};
+use fadupes::{AudioFile, ResumeCache, parse_size_filter, SizeFilter};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -53,6 +53,12 @@ fn main() {
                 .action(ArgAction::SetTrue)
                 .help("Disable resuming from / saving to the state file"),
         )
+        .arg(
+            Arg::new("ignore_size")
+                .long("ignore-size")
+                .value_name("EXPR")
+                .help(r#"Ignore files by size. Examples: "<3MB", ">800MB", "3MB..800MB""#),
+        )
         .get_matches();
 
     let inputs: Vec<PathBuf> = matches
@@ -64,6 +70,15 @@ fn main() {
     let skip_unique_size = matches.get_flag("skip_unique_size");
     let ignore_symlinks = matches.get_flag("nosym");
     let no_resume = matches.get_flag("no_resume");
+    let ignore_size_expr = matches.get_one::<String>("ignore_size").cloned();
+    let ignore_size: Option<SizeFilter> = ignore_size_expr
+        .as_deref()
+        .map(parse_size_filter)
+        .transpose()
+        .unwrap_or_else(|e| {
+            eprintln!("--ignore-size parse error: {e}");
+            std::process::exit(2);
+        });
     let provided_state_file = matches
         .get_one::<PathBuf>("state_file")
         .cloned();
@@ -108,6 +123,7 @@ fn main() {
                 skip_unique_size,
                 ignore_symlinks,
                 resume_cache.clone(),
+                ignore_size.as_ref(),
             )
             .into_par_iter()
         })
