@@ -267,7 +267,7 @@ impl ResumeCache {
         // Atomic-ish save: write to a temp file then rename, so we don't leave a half-written JSON behind
         let tmp_path = self.path.with_extension("tmp");
         let file = File::create(&tmp_path)?;
-        serde_json::to_writer_pretty(&file, &snapshot)?;
+        serde_json::to_writer(&file, &snapshot)?;
         file.sync_all()?; // ensure bytes hit disk before rename
         std::fs::rename(tmp_path, &self.path)?;
         Ok(())
