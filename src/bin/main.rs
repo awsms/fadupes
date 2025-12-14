@@ -1,9 +1,11 @@
 use clap::{Arg, ArgAction, Command, ValueHint, crate_version, value_parser};
-use fadupes::AudioFile;
+use ctrlc;
+use fadupes::{AudioFile, ResumeCache};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 fn main() {
     let matches = Command::new("Audio dupechecker")
@@ -33,6 +35,19 @@ fn main() {
                 .help("Disable showing the file list as files are scanned"),
         )
         .arg(
+            Arg::new("resume")
+                .long("resume")
+                .action(ArgAction::SetTrue)
+                .help("Resume from and persist scan progress to a state file"),
+        )
+        .arg(
+            Arg::new("state_file")
+                .long("state-file")
+                .value_hint(ValueHint::FilePath)
+                .help("Path to the resume state file (default: fadupes_state.json)")
+                .value_parser(value_parser!(PathBuf)),
+        )
+        .arg(
             Arg::new("nosym")
                 .long("nosym")
                 .action(ArgAction::SetTrue)
@@ -48,6 +63,29 @@ fn main() {
     let list_files = !matches.get_flag("nolist");
     let skip_unique_size = matches.get_flag("skip_unique_size");
     let ignore_symlinks = matches.get_flag("nosym");
+    let provided_state_file = matches
+        .get_one::<PathBuf>("state_file")
+        .cloned();
+    let resume_enabled = matches.get_flag("resume") || provided_state_file.is_some();
+    let state_file = provided_state_file.unwrap_or_else(|| PathBuf::from("fadupes_state.json"));
+    let resume_cache = if resume_enabled {
+        Some(Arc::new(ResumeCache::load(state_file)))
+    } else {
+        None
+    };
+
+    if let Some(cache) = resume_cache.as_ref() {
+        let cache_for_signal = Arc::clone(cache);
+        ctrlc::set_handler(move || {
+            let _ = cache_for_signal.save();
+            eprintln!(
+                "\nSaved resume state to {}",
+                cache_for_signal.path().display()
+            );
+            std::process::exit(130);
+        })
+        .expect("Error setting Ctrl+C handler");
+    }
 
     // Create a HashSet of scanned directories to pass to the walk_dir function
     let scanned_dirs: HashSet<PathBuf> = inputs.iter().cloned().collect();
@@ -67,6 +105,7 @@ fn main() {
                 list_files,
                 skip_unique_size,
                 ignore_symlinks,
+                resume_cache.clone(),
             )
             .into_par_iter()
         })

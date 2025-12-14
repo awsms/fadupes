@@ -1,17 +1,18 @@
 use hound::WavReader;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use std::collections::HashSet;
-use std::fs::File;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs::read_link;
+use std::fs::File;
 use std::io::Write; // New import to handle writing to log files
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 use walkdir::WalkDir;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioFile {
     pub file_path: String,
     pub file_name: String,
@@ -22,6 +23,8 @@ pub struct AudioFile {
     pub peak_level: f32,
     pub rms_db_level: f64,
     pub crc32: String,
+    pub file_size: u64,
+    pub modified_secs: u64,
 }
 
 impl Default for AudioFile {
@@ -36,7 +39,99 @@ impl Default for AudioFile {
             peak_level: 0.0,
             rms_db_level: 0.0,
             crc32: String::default(),
+            file_size: 0,
+            modified_secs: 0,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedEntry {
+    pub audio_file: AudioFile,
+    pub file_size: u64,
+    pub modified_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumeCache {
+    pub path: PathBuf,
+    pub data: Arc<Mutex<HashMap<String, CachedEntry>>>,
+    pub save_every: usize,
+    pub pending: Arc<AtomicUsize>,
+}
+
+impl ResumeCache {
+    pub fn load(path: PathBuf) -> Self {
+        let data = std::fs::File::open(&path)
+            .ok()
+            .and_then(|file| serde_json::from_reader::<_, HashMap<String, CachedEntry>>(file).ok())
+            .unwrap_or_default();
+
+        ResumeCache {
+            path,
+            data: Arc::new(Mutex::new(data)),
+            save_every: 5,
+            pending: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn lookup(&self, file_path: &Path, file_size: u64, modified_secs: u64) -> Option<AudioFile> {
+        let map = self.data.lock().ok()?;
+        map.get(&file_path.to_string_lossy().to_string())
+            .and_then(|entry| {
+                if entry.file_size == file_size && entry.modified_secs == modified_secs {
+                    Some(entry.audio_file.clone())
+                } else {
+                    None
+                }
+            })
+    }
+
+    pub fn store(&self, audio_file: AudioFile, file_size: u64, modified_secs: u64) {
+        if let Ok(mut map) = self.data.lock() {
+            map.insert(
+                audio_file.file_path.clone(),
+                CachedEntry {
+                    audio_file,
+                    file_size,
+                    modified_secs,
+                },
+            );
+        }
+
+        let count = self.pending.fetch_add(1, Ordering::Relaxed) + 1;
+        if count == 1 || count % self.save_every == 0 {
+            let _ = self.save();
+        }
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        let snapshot = {
+            let map = self.data.lock().unwrap();
+            map.clone()
+        };
+
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        let tmp_path = self.path.with_extension("tmp");
+        let file = File::create(&tmp_path)?;
+        serde_json::to_writer_pretty(file, &snapshot)?;
+        std::fs::rename(tmp_path, &self.path)?;
+        Ok(())
+    }
+}
+
+impl Drop for ResumeCache {
+    fn drop(&mut self) {
+        let _ = self.save();
     }
 }
 
@@ -48,6 +143,7 @@ impl AudioFile {
         list_files: bool,
         skip_unique_size: bool,
         ignore_symlinks: bool,
+        resume_cache: Option<Arc<ResumeCache>>,
     ) -> Vec<AudioFile> {
         // Lazily create the error log file on first error
         let error_log_file: Arc<Mutex<Option<File>>> = Arc::new(Mutex::new(None));
@@ -79,18 +175,26 @@ impl AudioFile {
                     }
                 }
 
+                let Ok(metadata) = std::fs::metadata(f.path()) else {
+                    return None;
+                };
+
                 // Filter by file extension (flac or wav) and file size
                 let Some(extension) = f.path().extension() else {
                     return None;
                 };
 
-                let size_ok = std::fs::metadata(f.path())
-                    .map(|meta| meta.len() <= 300 * 1024 * 1024) // Check if file is <= 300MB
-                    .unwrap_or(false);
+                let size_ok = metadata.len() <= 300 * 1024 * 1024; // Check if file is <= 300MB
 
                 if (extension == "flac" || extension == "wav") && size_ok {
-                    let size = std::fs::metadata(f.path()).map(|m| m.len()).unwrap_or(0);
-                    Some((f, size))
+                    let size = metadata.len();
+                    let modified_secs = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    Some((f, size, modified_secs))
                 } else {
                     None
                 }
@@ -140,7 +244,7 @@ impl AudioFile {
             );
             let size_counts = if skip_unique_size {
                 let mut counts = std::collections::HashMap::new();
-                for (_, size) in &files_to_process {
+                for (_, size, _) in &files_to_process {
                     *counts.entry(*size).or_insert(0usize) += 1;
                 }
                 Some(counts)
@@ -150,7 +254,7 @@ impl AudioFile {
 
             files_to_process
                 .par_iter()
-                .filter_map(|(entry, size)| {
+                .filter_map(|(entry, size, modified_secs)| {
                     let path_str = entry.path().to_string_lossy().to_string();
                     let progress = progress_bar.clone();
 
@@ -172,6 +276,21 @@ impl AudioFile {
                         return None;
                     }
 
+                    if let Some(cache) = resume_cache.as_ref() {
+                        if let Some(audio_file) =
+                            cache.lookup(entry.path(), *size, *modified_secs)
+                        {
+                            if let Some(ref mp) = list_mp {
+                                let _ = mp.println(format!(
+                                    "Using cached result for: {}",
+                                    entry.path().display()
+                                ));
+                            }
+                            progress.inc(1);
+                            return Some(audio_file);
+                        }
+                    }
+
                     let start_order = start_counter.fetch_add(1, Ordering::Relaxed) + 1;
                     let per_file_pb = {
                         let bars = Arc::clone(&list_bars);
@@ -182,7 +301,14 @@ impl AudioFile {
                     };
 
                     let result = match AudioFile::process_audio_file(entry) {
-                        Ok(audio_file) => Some(audio_file),
+                        Ok(mut audio_file) => {
+                            audio_file.file_size = *size;
+                            audio_file.modified_secs = *modified_secs;
+                            if let Some(cache) = resume_cache.as_ref() {
+                                cache.store(audio_file.clone(), *size, *modified_secs);
+                            }
+                            Some(audio_file)
+                        }
                         Err(err) => {
                             let error_message =
                                 format!("Error processing file: {}: {:?}", path_str, err);
@@ -217,7 +343,7 @@ impl AudioFile {
         } else {
             let size_counts = if skip_unique_size {
                 let mut counts = std::collections::HashMap::new();
-                for (_, size) in &files_to_process {
+                for (_, size, _) in &files_to_process {
                     *counts.entry(*size).or_insert(0usize) += 1;
                 }
                 Some(counts)
@@ -227,7 +353,7 @@ impl AudioFile {
 
             files_to_process
                 .par_iter()
-                .filter_map(|(entry, size)| {
+                .filter_map(|(entry, size, modified_secs)| {
                     let path_str = entry.path().to_string_lossy().to_string();
                     let progress = progress_bar.clone();
 
@@ -243,8 +369,24 @@ impl AudioFile {
                         return None;
                     }
 
+                    if let Some(cache) = resume_cache.as_ref() {
+                        if let Some(audio_file) =
+                            cache.lookup(entry.path(), *size, *modified_secs)
+                        {
+                            progress.inc(1);
+                            return Some(audio_file);
+                        }
+                    }
+
                     let result = match AudioFile::process_audio_file(entry) {
-                        Ok(audio_file) => Some(audio_file),
+                        Ok(mut audio_file) => {
+                            audio_file.file_size = *size;
+                            audio_file.modified_secs = *modified_secs;
+                            if let Some(cache) = resume_cache.as_ref() {
+                                cache.store(audio_file.clone(), *size, *modified_secs);
+                            }
+                            Some(audio_file)
+                        }
                         Err(err) => {
                             let error_message =
                                 format!("Error processing file: {}: {:?}", path_str, err);
@@ -272,6 +414,10 @@ impl AudioFile {
                 })
                 .collect()
         };
+
+        if let Some(cache) = resume_cache.as_ref() {
+            let _ = cache.save();
+        }
 
         progress_bar.finish_with_message("All files processed");
         audio_files
