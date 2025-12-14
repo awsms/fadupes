@@ -35,12 +35,6 @@ fn main() {
                 .help("Disable showing the file list as files are scanned"),
         )
         .arg(
-            Arg::new("resume")
-                .long("resume")
-                .action(ArgAction::SetTrue)
-                .help("Resume from and persist scan progress to a state file"),
-        )
-        .arg(
             Arg::new("state_file")
                 .long("state-file")
                 .value_hint(ValueHint::FilePath)
@@ -53,6 +47,12 @@ fn main() {
                 .action(ArgAction::SetTrue)
                 .help("Ignore symlinks instead of following them"),
         )
+        .arg(
+            Arg::new("no_resume")
+                .long("no-resume")
+                .action(ArgAction::SetTrue)
+                .help("Disable resuming from / saving to the state file"),
+        )
         .get_matches();
 
     let inputs: Vec<PathBuf> = matches
@@ -63,10 +63,11 @@ fn main() {
     let list_files = !matches.get_flag("nolist");
     let skip_unique_size = matches.get_flag("skip_unique_size");
     let ignore_symlinks = matches.get_flag("nosym");
+    let no_resume = matches.get_flag("no_resume");
     let provided_state_file = matches
         .get_one::<PathBuf>("state_file")
         .cloned();
-    let resume_enabled = matches.get_flag("resume") || provided_state_file.is_some();
+    let resume_enabled = !no_resume;
     let state_file = provided_state_file.unwrap_or_else(|| PathBuf::from("fadupes_state.json"));
     let resume_cache = if resume_enabled {
         Some(Arc::new(ResumeCache::load(state_file)))

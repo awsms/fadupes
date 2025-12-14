@@ -29,8 +29,8 @@ fadupes -i <file1> <file2> "file"* ...
 
 - `-i, --input`: Specify one or more files/directories to scan for audio files (required).
 - `--nosym`: Ignore symlinks instead of following them while scanning.
-- `--resume`: Load/save scan progress to a state file so an interrupted run can continue.
-- `--state-file`: Path to the state file used with `--resume` (default: `fadupes_state.json`). Supplying this flag implies `--resume`.
+- `--state-file`: Path to the state file used for resume (default: `fadupes_state.json`). The state file is loaded automatically if it exists and saved on exit/Ctrl+C.
+- `--no-resume`: Disable loading/saving the state file.
 
 Resume notes:
 - State files are written where you run the command (or the path you pass to `--state-file`).
