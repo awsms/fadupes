@@ -1,8 +1,10 @@
 use hound::WavReader;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::File;
 use std::fs::read_link;
 use std::io::ErrorKind;
@@ -92,6 +94,33 @@ fn parse_size_bytes(s: &str) -> Result<u64, String> {
     Ok(bytes.round() as u64)
 }
 
+// Fallback RMS value used when data is missing or non-finite
+fn default_rms_db_level() -> f64 {
+    -1000.0
+}
+
+fn deserialize_rms_db_level<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Accept null/missing and clamp non-finite to the fallback
+    let val = Option::<f64>::deserialize(deserializer)?;
+    let v = val.unwrap_or_else(default_rms_db_level);
+    if v.is_finite() {
+        Ok(v)
+    } else {
+        Ok(default_rms_db_level())
+    }
+}
+
+fn clean_rms_db_level(v: f64) -> f64 {
+    if v.is_finite() {
+        v
+    } else {
+        default_rms_db_level()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioFile {
     pub file_path: String,
@@ -101,6 +130,10 @@ pub struct AudioFile {
     pub bit_depth: u32,
     pub channels: u32,
     pub peak_level: f32,
+    #[serde(
+        default = "default_rms_db_level",
+        deserialize_with = "deserialize_rms_db_level"
+    )]
     pub rms_db_level: f64,
     pub crc32: String,
     pub file_size: u64,
@@ -151,6 +184,7 @@ impl ResumeCache {
                         "Warning: failed to parse state file {}: {err}. Starting with empty state.",
                         path.display()
                     );
+                    backup_broken(&path, &format!("{err}"));
                     HashMap::new()
                 }
             },
@@ -160,6 +194,7 @@ impl ResumeCache {
                     "Warning: failed to open state file {}: {err}. Starting with empty state.",
                     path.display()
                 );
+                backup_broken(&path, &format!("{err}"));
                 HashMap::new()
             }
         };
@@ -263,7 +298,7 @@ impl AudioFile {
 
         // Collect the list of audio files to process
         let files_to_process: Vec<_> = WalkDir::new(dir)
-            .follow_links(!ignore_symlinks) // Follow symlinks by default; skip loop-back symlinks into input roots (and skip all symlinks if --nosym is set).
+            .follow_links(!ignore_symlinks) // Follow symlinks by default; skip loop-back symlinks into input roots (and skip all symlinks if --nosym is set)
             .sort_by_file_name()
             .into_iter()
             .filter_map(|e| e.ok())
@@ -565,11 +600,11 @@ impl AudioFile {
                 audio_file.channels = stream_info.channels;
 
                 let (peak_level, rms_db_level) = Self::accumulate_metrics(
-                    reader.samples().map(|sample| sample.unwrap_or(0) as i16),
+                    reader.samples().map(|sample| sample.unwrap_or(0)),
                     stream_info.bits_per_sample as i32,
                 );
                 audio_file.peak_level = peak_level;
-                audio_file.rms_db_level = rms_db_level;
+                audio_file.rms_db_level = clean_rms_db_level(rms_db_level);
             }
             "wav" => {
                 let mut reader =
@@ -580,12 +615,24 @@ impl AudioFile {
                 audio_file.bit_depth = spec.bits_per_sample as u32;
                 audio_file.channels = spec.channels as u32;
 
-                let (peak_level, rms_db_level) = Self::accumulate_metrics(
-                    reader.samples::<i16>().map(|s| s.unwrap_or(0)),
-                    spec.bits_per_sample as i32,
-                );
+                // Read with the correct sample width so 24/32-bit WAVs are handled correctly
+                let (peak_level, rms_db_level) = match spec.bits_per_sample {
+                    8 => Self::accumulate_metrics(
+                        reader.samples::<i8>().map(|s| s.unwrap_or(0) as i32),
+                        8,
+                    ),
+                    16 => Self::accumulate_metrics(
+                        reader.samples::<i16>().map(|s| s.unwrap_or(0) as i32),
+                        16,
+                    ),
+                    24 | 32 => Self::accumulate_metrics(
+                        reader.samples::<i32>().map(|s| s.unwrap_or(0)),
+                        spec.bits_per_sample as i32,
+                    ),
+                    _ => return Err(ProcessError::UnsupportedBitDepth),
+                };
                 audio_file.peak_level = peak_level;
-                audio_file.rms_db_level = rms_db_level;
+                audio_file.rms_db_level = clean_rms_db_level(rms_db_level);
             }
             _ => return Err(ProcessError::UnsupportedBitDepth),
         }
@@ -593,12 +640,16 @@ impl AudioFile {
         Ok(audio_file)
     }
 
-    // Single-pass over samples: compute peak + RMS(dB). Empty input => -inf dB to avoid log10(0)
+    // Single-pass over samples: compute peak + RMS(dB). Empty input => fallback dB to avoid log10(0)
     fn accumulate_metrics<I>(samples: I, bit_depth: i32) -> (f32, f64)
     where
-        I: Iterator<Item = i16>,
+        I: Iterator<Item = i32>,
     {
         let max_amplitude = Self::get_max_amplitude(bit_depth) as f64;
+        if max_amplitude <= 0.0 {
+            return (0.0, default_rms_db_level());
+        }
+
         let mut max_abs = 0i32;
         let mut squared_sum = 0f64;
         let mut count = 0u64;
@@ -617,14 +668,18 @@ impl AudioFile {
         let peak_level = if max_abs == 0 {
             0.0
         } else {
-            max_abs as f32 / i16::MAX as f32
+            max_abs as f32 / Self::get_max_amplitude(bit_depth) as f32
         };
 
         let rms_db_level = if count == 0 {
-            f64::NEG_INFINITY
+            default_rms_db_level()
         } else {
             let rms_amplitude = (squared_sum / count as f64).sqrt();
-            20.0 * rms_amplitude.log10()
+            if rms_amplitude > 0.0 {
+                20.0 * rms_amplitude.log10()
+            } else {
+                default_rms_db_level()
+            }
         };
 
         (peak_level, rms_db_level)
@@ -632,8 +687,11 @@ impl AudioFile {
 
     fn get_max_amplitude(bit_depth: i32) -> i32 {
         match bit_depth {
+            8 => i8::MAX as i32,
             16 => i16::MAX as i32,
-            _ => i16::MAX as i32,
+            24 => (1 << 23) - 1,
+            32 => i32::MAX,
+            _ => 0,
         }
     }
 
@@ -674,5 +732,30 @@ impl From<std::io::Error> for ProcessError {
 impl From<claxon::Error> for ProcessError {
     fn from(err: claxon::Error) -> ProcessError {
         ProcessError::FlacError(err)
+    }
+}
+
+fn backup_broken(path: &Path, reason: &str) {
+    let broken = if let Some(ext) = path.extension() {
+        let mut new_ext = OsString::from(ext);
+        new_ext.push(".broken");
+        path.with_extension(new_ext)
+    } else {
+        path.with_extension("broken")
+    };
+
+    match std::fs::rename(path, &broken) {
+        Ok(_) => eprintln!(
+            "State file moved to {} due to load error: {}",
+            broken.display(),
+            reason
+        ),
+        Err(err) => eprintln!(
+            "Warning: failed to move state file {} to {} after error {}: {}",
+            path.display(),
+            broken.display(),
+            reason,
+            err
+        ),
     }
 }
