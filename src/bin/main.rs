@@ -157,7 +157,17 @@ fn compare_audio_files(audio_files: &[AudioFile]) {
         println!("Found {} identical files:", total_dupes);
 
         writeln!(log_file, "Identical Files Found:").expect("Failed to write to log file");
+        let mut seen_groups: HashSet<Vec<String>> = HashSet::new();
+
         for group in identical_groups {
+            // stable signature: sorted list of paths
+            let mut sig: Vec<String> = group.iter().map(|f| f.file_path.clone()).collect();
+            sig.sort_unstable();
+
+            if !seen_groups.insert(sig) {
+                continue; // already logged this exact set of paths in THIS run
+            }
+
             writeln!(log_file, "#").expect("Failed to write to log file"); // Add separator for each dupe group
             for file in group {
                 println!("{}", file.file_path);
