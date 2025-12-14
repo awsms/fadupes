@@ -1,67 +1,178 @@
-# FindAudioDupes (fadupes)
+# fadupes - FindAudioDupes
 
-fadupes is an experimental CLI tool to help you dupecheck your music collection.
+`fadupes` is a CLI tool to help you find identical audio files in a music collection by scanning directories and files recursively and comparing audio characteristics.
+
+---
 
 ## Features
 
-- **Directory Scanning**: Easily scan one or multiple directories for audio files.
-- **Recursive Scanning**: Directories are processed recursively.
-- **Duplicate Identification**: Identifies identical audio files by comparing audio properties.
-- **Logging**: Path of duplicate files are logged for later review/scripting their deletion.
+- **Recursive directory scanning**
+  - Accepts one or more directories and/or files as input
+- **Parallel processing**
+  - Uses multiple threads for faster scans
+- **Progress display**
+  - Global progress bar
+  - Optional per-file “currently scanning” output
+- **Resumable scans**
+  - Optional JSON state file
+  - Automatically loads existing state
+  - Periodically saved during processing
+  - Saved automatically on Ctrl+C
+- **Symlink handling**
+  - Follows symlinks by default
+  - Option to ignore symlinks
+  - Avoids loop-back symlinks into scanned roots
+- **Filtering options**
+  - Ignore files by size (`<`, `>`, or range)
+  - Skip files with a unique byte size for faster scans
+- **Logging**
+  - Duplicate groups written to `identical_files.log`
+  - Processing errors written to `identical_files_errors.log`
 
-## Installation
+---
 
-Make sure you have Rust and Cargo installed on your machine. Clone the repository and run:
+## Building
+
+You need Rust and Cargo installed.
 
 ```bash
 cargo build --release
+````
+
+The binary will be available at:
+
+```bash
+target/release/fadupes
 ```
+
+---
 
 ## Usage
 
+### Basic usage
+
 ```bash
 fadupes -i <path>
-fadupes -i <directory1> <directory2> <file1> <file2> ...
-fadupes -i <file1> <file2> "file"* ...
+fadupes -i <directory1> <directory2>
+fadupes -i <file1> <file2>
 ```
 
-### Arguments
+Inputs may be directories, files, or any combination of both.
 
-- `-i, --input`: Specify one or more files/directories to scan for audio files (required).
-- `--nosym`: Ignore symlinks instead of following them while scanning.
-- `--state-file`: Path to the state file used for resume (default: `fadupes_state.json`). The state file is loaded automatically if it exists and saved on exit/Ctrl+C.
-- `--no-resume`: Disable loading/saving the state file.
+---
 
-Resume notes:
-- State files are written where you run the command (or the path you pass to `--state-file`).
-- On Ctrl+C the tool saves the cache before exiting.
+## Command-line options
 
-## Example
+### Required
+
+* `-i, --input <PATHS...>`
+
+  * One or more files or directories to scan
+
+### Optional
+
+* `--nolist`
+
+  * Disable per-file list output (keeps only the global progress bar)
+
+* `--nosym`
+
+  * Ignore symlinks instead of following them
+
+* `--skip-unique-size`
+
+  * Skip files whose byte size appears only once
+    (faster, but may miss duplicates)
+
+* `--ignore-size <EXPR>`
+
+  * Ignore files by size
+  * Examples:
+
+    * `<3MB`
+    * `>800MB`
+    * `3MB..800MB`
+
+* `--state-file <PATH>`
+
+  * Path to the resume state file
+  * Default: `fadupes_state.json`
+
+* `--no-resume`
+
+  * Disable loading and saving of the resume state
+
+---
+
+## Resume behavior
+
+* State files are written in the current working directory by default
+* If the state file exists, it is loaded automatically
+* The state is saved periodically during the scan
+* On Ctrl+C, the state is saved before exiting
+
+---
+
+## How duplicate detection works
+
+Each audio file is decoded and analyzed to extract audio properties.
+Files are considered identical if all of the following match:
+
+* Total sample count
+* Sample rate
+* Bit depth
+* Channel count
+* Peak level
+* RMS level (dB)
+
+Files sharing the same characteristics are grouped together as duplicates.
+
+---
+
+## Output
+
+* **Console**
+
+  * Duplicate groups are printed to stdout
+
+* **Files**
+
+  * `identical_files.log`
+
+    * Appended with duplicate file paths (grouped)
+  * `identical_files_errors.log`
+
+    * Created only if errors occur during processing
+
+---
+
+## Supported formats and limits
+
+* Supported formats: **WAV**, **FLAC**
+* Files larger than **800 MB** are currently skipped
+
+---
+
+## Development
+
+Run in debug mode:
 
 ```bash
-fadupes -i /path/to/audio1 /path/to/audio2.flac /path/to/audio3.wav
+cargo run -- -i /path/to/music
 ```
 
-## How It Works
-
-1. **Input Handling**: The tool accepts one or more directory paths and scans for audio files within. Also accepts files directly.
-2. **Audio File Processing**: Each audio file is analyzed to extract key properties such as sample rate, bit depth, and CRC32 checksum.
-3. **Duplicate Comparison**: The audio files are compared based on their properties, and identical files are identified and logged.
-4. **Output**: Unique and duplicate files are printed to the console, and duplicates are saved in `identical_files.log`.
-
-## Dependencies
-
-- `rayon`: For parallel processing.
-- `hound`: For WAV file reading.
-- `claxon`: For FLAC file reading.
-- `crc32fast`: For CRC32 calculations.
-- `walkdir`: For traversing directories.
+---
 
 ## Current limitations
 
-Only WAV and FLAC supported for now.
+* Only WAV and FLAC are supported
+* Duplicate detection is based on decoded audio characteristics, not tags
+* No built-in deletion or interactive duplicate management
+
+---
 
 ## TODO
-- [ ] Build a database of tracks that will be updated whenever this program is executed.
-- [ ] Add a flag to delete dupes, which will let the user pick the file to keep/delete in the terminal.
-- [ ] Display current progress during the scan, including the files being processed and a percentage completion. 
+
+- [ ] Additional audio formats
+- [ ] Interactive duplicate handling
+- [ ] Persistent audio database of all scans
