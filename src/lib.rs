@@ -3,9 +3,9 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::read_link;
 use std::fs::File;
-use std::io::Write; // New import to handle writing to log files
+use std::fs::read_link;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -137,6 +137,7 @@ pub struct ResumeCache {
     pub data: Arc<Mutex<HashMap<String, CachedEntry>>>,
     pub save_every: usize,
     pub pending: Arc<AtomicUsize>,
+    save_lock: Arc<Mutex<()>>,
 }
 
 impl ResumeCache {
@@ -149,8 +150,9 @@ impl ResumeCache {
         ResumeCache {
             path,
             data: Arc::new(Mutex::new(data)),
-            save_every: 5,
+            save_every: 250,
             pending: Arc::new(AtomicUsize::new(0)),
+            save_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -159,7 +161,12 @@ impl ResumeCache {
     }
 
     // Cache entry is valid only if size + modified time match (cheap change detector)
-    pub fn lookup(&self, file_path: &Path, file_size: u64, modified_secs: u64) -> Option<AudioFile> {
+    pub fn lookup(
+        &self,
+        file_path: &Path,
+        file_size: u64,
+        modified_secs: u64,
+    ) -> Option<AudioFile> {
         let map = self.data.lock().ok()?;
         map.get(&file_path.to_string_lossy().to_string())
             .and_then(|entry| {
@@ -185,12 +192,17 @@ impl ResumeCache {
 
         // Throttle disk writes: save cache every 'save_every' inserts (AtomicUsize so threads coordinate cheaply)
         let count = self.pending.fetch_add(1, Ordering::Relaxed) + 1;
-        if count == 1 || count % self.save_every == 0 {
+        if count >= self.save_every {
+            // Reset the counter before saving so new inserts can keep counting while we write
+            self.pending.store(0, Ordering::Relaxed);
             let _ = self.save();
         }
     }
 
     pub fn save(&self) -> std::io::Result<()> {
+        // Serialize writers to the temp file/rename to avoid corruption from concurrent saves
+        let _lock = self.save_lock.lock().unwrap();
+
         let snapshot = {
             let map = self.data.lock().unwrap();
             map.clone()
@@ -205,7 +217,8 @@ impl ResumeCache {
         // Atomic-ish save: write to a temp file then rename, so we don't leave a half-written JSON behind
         let tmp_path = self.path.with_extension("tmp");
         let file = File::create(&tmp_path)?;
-        serde_json::to_writer_pretty(file, &snapshot)?;
+        serde_json::to_writer_pretty(&file, &snapshot)?;
+        file.sync_all()?; // ensure bytes hit disk before rename
         std::fs::rename(tmp_path, &self.path)?;
         Ok(())
     }
@@ -368,8 +381,7 @@ impl AudioFile {
                     }
 
                     if let Some(cache) = resume_cache.as_ref() {
-                        if let Some(audio_file) =
-                            cache.lookup(entry.path(), *size, *modified_secs)
+                        if let Some(audio_file) = cache.lookup(entry.path(), *size, *modified_secs)
                         {
                             if let Some(ref mp) = list_mp {
                                 let _ = mp.println(format!(
@@ -461,8 +473,7 @@ impl AudioFile {
                     }
 
                     if let Some(cache) = resume_cache.as_ref() {
-                        if let Some(audio_file) =
-                            cache.lookup(entry.path(), *size, *modified_secs)
+                        if let Some(audio_file) = cache.lookup(entry.path(), *size, *modified_secs)
                         {
                             progress.inc(1);
                             return Some(audio_file);
