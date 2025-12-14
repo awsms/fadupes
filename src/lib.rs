@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::fs::read_link;
+use std::io::ErrorKind;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -142,10 +143,26 @@ pub struct ResumeCache {
 
 impl ResumeCache {
     pub fn load(path: PathBuf) -> Self {
-        let data = std::fs::File::open(&path)
-            .ok()
-            .and_then(|file| serde_json::from_reader::<_, HashMap<String, CachedEntry>>(file).ok())
-            .unwrap_or_default();
+        let data = match std::fs::File::open(&path) {
+            Ok(file) => match serde_json::from_reader::<_, HashMap<String, CachedEntry>>(file) {
+                Ok(map) => map,
+                Err(err) => {
+                    eprintln!(
+                        "Warning: failed to parse state file {}: {err}. Starting with empty state.",
+                        path.display()
+                    );
+                    HashMap::new()
+                }
+            },
+            Err(err) if err.kind() == ErrorKind::NotFound => HashMap::new(),
+            Err(err) => {
+                eprintln!(
+                    "Warning: failed to open state file {}: {err}. Starting with empty state.",
+                    path.display()
+                );
+                HashMap::new()
+            }
+        };
 
         ResumeCache {
             path,
