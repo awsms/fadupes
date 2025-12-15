@@ -173,7 +173,7 @@ pub struct ResumeCache {
 }
 
 impl ResumeCache {
-    pub fn load(path: PathBuf) -> Self {
+    pub fn load(path: PathBuf, save_every: usize) -> Self {
         let data = match std::fs::File::open(&path) {
             Ok(file) => match serde_json::from_reader::<_, HashMap<String, CachedEntry>>(file) {
                 Ok(map) => map,
@@ -200,7 +200,7 @@ impl ResumeCache {
         ResumeCache {
             path,
             data: Arc::new(Mutex::new(data)),
-            save_every: 250,
+            save_every,
             pending: Arc::new(AtomicUsize::new(0)),
             save_lock: Arc::new(Mutex::new(())),
         }

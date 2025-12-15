@@ -79,6 +79,11 @@ Inputs may be directories, files, or any combination of both.
 
   * Ignore symlinks instead of following them
 
+* `--checkpoint <N>`
+
+  * Save the resume JSON file every `N` scanned files
+  * Default: `250`
+
 * `--skip-unique-size`
 
   * Skip files whose byte size appears only once
@@ -108,7 +113,7 @@ Inputs may be directories, files, or any combination of both.
 
 * State files are written in the current working directory by default
 * If the state file exists, it is loaded automatically
-* The state is saved periodically during the scan
+* The state is saved periodically during the scan (tune with `--checkpoint`)
 * On Ctrl+C, the state is saved before exiting
 
 ---

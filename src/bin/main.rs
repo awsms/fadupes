@@ -59,6 +59,14 @@ fn main() {
                 .value_name("EXPR")
                 .help(r#"Ignore files by size. Examples: "<3MB", ">800MB", "3MB..800MB""#),
         )
+        .arg(
+            Arg::new("checkpoint")
+                .long("checkpoint")
+                .value_name("N")
+                .help("Save the resume JSON every N scanned files")
+                .default_value("250")
+                .value_parser(value_parser!(usize)),
+        )
         .get_matches();
 
     let inputs: Vec<PathBuf> = matches
@@ -79,11 +87,18 @@ fn main() {
             eprintln!("--ignore-size parse error: {e}");
             std::process::exit(2);
         });
+    let checkpoint = *matches
+        .get_one::<usize>("checkpoint")
+        .expect("defaulted above");
+    if checkpoint == 0 {
+        eprintln!("--checkpoint must be at least 1");
+        std::process::exit(2);
+    }
     let provided_state_file = matches.get_one::<PathBuf>("state_file").cloned();
     let resume_enabled = !no_resume;
     let state_file = provided_state_file.unwrap_or_else(|| PathBuf::from("fadupes_state.json"));
     let resume_cache = if resume_enabled {
-        Some(Arc::new(ResumeCache::load(state_file)))
+        Some(Arc::new(ResumeCache::load(state_file, checkpoint)))
     } else {
         None
     };
