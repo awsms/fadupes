@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.0.4] - 2025-12-15
+
+### 🐛 Bug Fixes
+
+- *(resume)* Serialize cache saves and harden atomic writes
+- *(resume)* Handle missing or corrupt state file gracefully
+- *(resume)* Clamp RMS values and back up broken state files
+- *(resume)* Keep progress in sync after cached/unique skips
+- *(perfs)* Serde_json::to_writer instead of prettier (*1.15 faster)
+
+### 🚜 Refactor
+
+- *(resume)* Unify skip/cache handling across walk_dir branches
+
+### ⚙️ Miscellaneous Tasks
+
+- *(cleanup)* Drop unused crc32 field and dependency
+- *(release)* Bump to v1.0.4
+
 ## [1.0.3] - 2025-12-14
 
 ### 🚀 Features
