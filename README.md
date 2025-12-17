@@ -84,6 +84,11 @@ Inputs may be directories, files, or any combination of both.
   * Save the resume JSON file every `N` scanned files
   * Default: `250`
 
+* `-t, --threads <N>`
+
+  * Set the number of threads used for parallel scanning
+  * Examples: `-t5`, `-t 5`, `--threads 5`
+
 * `--skip-unique-size`
 
   * Skip files whose byte size appears only once

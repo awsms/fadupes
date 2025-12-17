@@ -67,7 +67,30 @@ fn main() {
                 .default_value("250")
                 .value_parser(value_parser!(usize)),
         )
+        .arg(
+            Arg::new("threads")
+                .short('t')
+                .long("threads")
+                .value_name("N")
+                .help("Set number of threads used for parallel scanning (default: Rayon default)")
+                .value_parser(value_parser!(usize)),
+        )
         .get_matches();
+
+    let threads = matches.get_one::<usize>("threads").copied();
+    if let Some(threads) = threads {
+        if threads == 0 {
+            eprintln!("--threads must be at least 1");
+            std::process::exit(2);
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to configure Rayon thread pool: {e}");
+                std::process::exit(2);
+            });
+    }
 
     let inputs: Vec<PathBuf> = matches
         .get_many::<PathBuf>("input")
