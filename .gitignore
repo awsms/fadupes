@@ -5,3 +5,7 @@
 /.vscode
 /fadupes*
 /*.patch
+**.flac
+**.mp3
+**.log
+**.json
