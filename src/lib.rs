@@ -124,7 +124,6 @@ fn clean_rms_db_level(v: f64) -> f64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioFile {
     pub file_path: String,
-    pub file_name: String,
     pub total_samples: u64,
     pub sample_rate: u32,
     pub bit_depth: u32,
@@ -143,7 +142,6 @@ impl Default for AudioFile {
     fn default() -> Self {
         Self {
             file_path: String::default(),
-            file_name: String::default(),
             total_samples: 0,
             sample_rate: 0,
             bit_depth: 0,
