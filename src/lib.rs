@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, UNIX_EPOCH};
 use walkdir::WalkDir;
 
+const STATE_VERSION: u32 = 1;
+
 #[derive(Clone, Debug)]
 pub enum SizeFilter {
     Lt(u64),
@@ -164,9 +166,220 @@ pub struct CachedEntry {
 }
 
 #[derive(Debug, Clone)]
+struct CacheBase {
+    root: Option<PathBuf>,
+    entries: HashMap<String, CachedEntry>, // rel path when root is Some, absolute when None
+}
+
+#[derive(Debug, Clone)]
+struct CacheData {
+    bases: Vec<CacheBase>,
+}
+
+impl CacheData {
+    fn new() -> Self {
+        Self { bases: Vec::new() }
+    }
+
+    // Find the best-matching base (longest ancestor) for a given path and return its index + key used inside that base.
+    fn find_base_for_path(&self, path: &Path) -> Option<(usize, String)> {
+        let mut best: Option<(usize, usize, String)> = None; // (idx, root_len, key)
+
+        for (idx, base) in self.bases.iter().enumerate() {
+            match &base.root {
+                Some(root) => {
+                    if path.starts_with(root) {
+                        if let Ok(rel) = path.strip_prefix(root) {
+                            let rel_str = rel.to_string_lossy().to_string();
+                            let root_len = root.as_os_str().len();
+                            if best
+                                .as_ref()
+                                .map_or(true, |(_, best_len, _)| root_len > *best_len)
+                            {
+                                best = Some((idx, root_len, rel_str));
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let key = path.to_string_lossy().to_string();
+                    if base.entries.contains_key(&key)
+                        && best.as_ref().map_or(true, |(_, best_len, _)| *best_len == 0)
+                    {
+                        best = Some((idx, 0, key));
+                    }
+                }
+            }
+        }
+
+        best.map(|(idx, _, key)| (idx, key))
+    }
+
+    // Ensure we have a base for this path (using preferred_root as the new base root) and return base index + key.
+    fn ensure_base_for_path(&mut self, path: &Path, preferred_root: &Path) -> (usize, String) {
+        if let Some(found) = self.find_base_for_path(path) {
+            return found;
+        }
+
+        // Canonicalize the preferred root if possible for stability
+        let mut base_root = preferred_root.to_path_buf();
+        if let Ok(canon) = preferred_root.canonicalize() {
+            base_root = canon;
+        }
+
+        // If the path isn't under the preferred root, fall back to an unrooted base
+        let (root, key) = if path.starts_with(&base_root) {
+            let rel = path
+                .strip_prefix(&base_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            (Some(base_root), rel)
+        } else {
+            (
+                None,
+                path.to_string_lossy()
+                    .to_string(),
+            )
+        };
+
+        let idx = self.bases.len();
+        self.bases.push(CacheBase {
+            root,
+            entries: HashMap::new(),
+        });
+        (idx, key)
+    }
+
+    fn from_state_file(state: StateFile) -> Self {
+        if state.version != STATE_VERSION {
+            eprintln!(
+                "Warning: state file version {} differs from expected {}. Attempting to read anyway.",
+                state.version, STATE_VERSION
+            );
+        }
+        let mut data = CacheData::new();
+        for base in state.bases {
+            let root_path = base.root.as_deref().map(PathBuf::from);
+            let mut entries = HashMap::new();
+
+            for mut entry in base.entries {
+                // Determine the full path and normalize audio_file fields
+                let full_path = match (&root_path, entry.rel.as_deref(), entry.path.as_deref()) {
+                    (Some(root), Some(rel), _) => Some(root.join(rel)),
+                    (None, _, Some(path)) => Some(PathBuf::from(path)),
+                    _ => None,
+                };
+
+                if let Some(full_path) = full_path {
+                    hydrate_entry(&mut entry.entry, &full_path);
+                    let key = if let Some(rel) = entry.rel {
+                        rel
+                    } else {
+                        full_path.to_string_lossy().to_string()
+                    };
+                    entries.insert(key, entry.entry);
+                }
+            }
+
+            data.bases.push(CacheBase {
+                root: root_path,
+                entries,
+            });
+        }
+
+        data
+    }
+
+    fn from_legacy_map(map: HashMap<String, CachedEntry>) -> Self {
+        let mut base = CacheBase {
+            root: None,
+            entries: HashMap::new(),
+        };
+
+        for (path, mut entry) in map {
+            let full_path = PathBuf::from(&path);
+            hydrate_entry(&mut entry, &full_path);
+            base.entries.insert(path, entry);
+        }
+
+        CacheData { bases: vec![base] }
+    }
+}
+
+fn hydrate_entry(entry: &mut CachedEntry, full_path: &Path) {
+    entry.audio_file.file_path = full_path.to_string_lossy().to_string();
+    // Keep the duplicate fields aligned in case older caches had zeros in the AudioFile
+    entry.audio_file.file_size = entry.file_size;
+    entry.audio_file.modified_secs = entry.modified_secs;
+}
+
+fn state_from_cache(cache: &CacheData) -> StateFile {
+    let mut bases = Vec::new();
+
+    for base in &cache.bases {
+        let mut entries: Vec<(String, CachedEntry)> =
+            base.entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut state_entries = Vec::new();
+        for (key, mut entry) in entries {
+            let full_path = base
+                .root
+                .as_ref()
+                .map(|root| root.join(&key))
+                .unwrap_or_else(|| PathBuf::from(&key));
+            hydrate_entry(&mut entry, &full_path);
+
+            state_entries.push(StateEntry {
+                rel: base.root.as_ref().map(|_| key.clone()),
+                path: if base.root.is_some() { None } else { Some(key) },
+                entry,
+            });
+        }
+
+        bases.push(StateBase {
+            root: base
+                .root
+                .as_ref()
+                .map(|r| r.to_string_lossy().to_string()),
+            entries: state_entries,
+        });
+    }
+
+    StateFile {
+        version: STATE_VERSION,
+        bases,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StateEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(flatten)]
+    entry: CachedEntry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StateBase {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    root: Option<String>,
+    entries: Vec<StateEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StateFile {
+    version: u32,
+    bases: Vec<StateBase>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ResumeCache {
     pub path: PathBuf,
-    pub data: Arc<Mutex<HashMap<String, CachedEntry>>>,
+    data: Arc<Mutex<CacheData>>,
     pub save_every: usize,
     pub pending: Arc<AtomicUsize>,
     save_lock: Arc<Mutex<()>>,
@@ -174,26 +387,39 @@ pub struct ResumeCache {
 
 impl ResumeCache {
     pub fn load(path: PathBuf, save_every: usize) -> Self {
-        let data = match std::fs::File::open(&path) {
-            Ok(file) => match serde_json::from_reader::<_, HashMap<String, CachedEntry>>(file) {
-                Ok(map) => map,
-                Err(err) => {
-                    eprintln!(
-                        "Warning: failed to parse state file {}: {err}. Starting with empty state.",
-                        path.display()
-                    );
-                    backup_broken(&path, &format!("{err}"));
-                    HashMap::new()
+        let data = match std::fs::read_to_string(&path) {
+            Ok(contents) => {
+                // Try new format first
+                match serde_json::from_str::<StateFile>(&contents) {
+                    Ok(state) => CacheData::from_state_file(state),
+                    Err(_) => match serde_json::from_str::<HashMap<String, CachedEntry>>(&contents) {
+                        Ok(legacy) => {
+                            eprintln!(
+                                "Loaded legacy resume cache format from {} (will rewrite to v{}).",
+                                path.display(),
+                                STATE_VERSION
+                            );
+                            CacheData::from_legacy_map(legacy)
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "Warning: failed to parse state file {}: {err}. Starting with empty state.",
+                                path.display()
+                            );
+                            backup_broken(&path, &format!("{err}"));
+                            CacheData::new()
+                        }
+                    },
                 }
-            },
-            Err(err) if err.kind() == ErrorKind::NotFound => HashMap::new(),
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => CacheData::new(),
             Err(err) => {
                 eprintln!(
                     "Warning: failed to open state file {}: {err}. Starting with empty state.",
                     path.display()
                 );
                 backup_broken(&path, &format!("{err}"));
-                HashMap::new()
+                CacheData::new()
             }
         };
 
@@ -217,27 +443,40 @@ impl ResumeCache {
         file_size: u64,
         modified_secs: u64,
     ) -> Option<AudioFile> {
-        let map = self.data.lock().ok()?;
-        map.get(&file_path.to_string_lossy().to_string())
-            .and_then(|entry| {
-                if entry.file_size == file_size && entry.modified_secs == modified_secs {
-                    Some(entry.audio_file.clone())
-                } else {
-                    None
-                }
-            })
+        let data = self.data.lock().ok()?;
+        let (base_idx, key) = data.find_base_for_path(file_path)?;
+        let base = data.bases.get(base_idx)?;
+        base.entries.get(&key).and_then(|entry| {
+            if entry.file_size == file_size && entry.modified_secs == modified_secs {
+                Some(entry.audio_file.clone())
+            } else {
+                None
+            }
+        })
     }
 
-    pub fn store(&self, audio_file: AudioFile, file_size: u64, modified_secs: u64) {
-        if let Ok(mut map) = self.data.lock() {
-            map.insert(
-                audio_file.file_path.clone(),
-                CachedEntry {
-                    audio_file,
-                    file_size,
-                    modified_secs,
-                },
-            );
+    pub fn store(
+        &self,
+        mut audio_file: AudioFile,
+        file_size: u64,
+        modified_secs: u64,
+        base_root: &Path,
+    ) {
+        // Keep the duplicate fields consistent
+        audio_file.file_size = file_size;
+        audio_file.modified_secs = modified_secs;
+
+        if let Ok(mut data) = self.data.lock() {
+            let full_path = PathBuf::from(&audio_file.file_path);
+            let (base_idx, key) = data.ensure_base_for_path(&full_path, base_root);
+            let entry = CachedEntry {
+                audio_file,
+                file_size,
+                modified_secs,
+            };
+            if let Some(base) = data.bases.get_mut(base_idx) {
+                base.entries.insert(key, entry);
+            }
         }
 
         // Throttle disk writes: save cache every 'save_every' inserts (AtomicUsize so threads coordinate cheaply)
@@ -254,8 +493,8 @@ impl ResumeCache {
         let _lock = self.save_lock.lock().unwrap();
 
         let snapshot = {
-            let map = self.data.lock().unwrap();
-            map.clone()
+            let data = self.data.lock().unwrap();
+            data.clone()
         };
 
         if let Some(parent) = self.path.parent() {
@@ -267,7 +506,7 @@ impl ResumeCache {
         // Atomic-ish save: write to a temp file then rename, so we don't leave a half-written JSON behind
         let tmp_path = self.path.with_extension("tmp");
         let file = File::create(&tmp_path)?;
-        serde_json::to_writer(&file, &snapshot)?;
+        serde_json::to_writer(&file, &state_from_cache(&snapshot))?;
         file.sync_all()?; // ensure bytes hit disk before rename
         std::fs::rename(tmp_path, &self.path)?;
         Ok(())
@@ -502,7 +741,7 @@ impl AudioFile {
                             audio_file.file_size = *size;
                             audio_file.modified_secs = *modified_secs;
                             if let Some(cache) = resume_cache.as_ref() {
-                                cache.store(audio_file.clone(), *size, *modified_secs);
+                                cache.store(audio_file.clone(), *size, *modified_secs, dir);
                             }
                             Some(audio_file)
                         }
@@ -572,7 +811,7 @@ impl AudioFile {
                             audio_file.file_size = *size;
                             audio_file.modified_secs = *modified_secs;
                             if let Some(cache) = resume_cache.as_ref() {
-                                cache.store(audio_file.clone(), *size, *modified_secs);
+                                cache.store(audio_file.clone(), *size, *modified_secs, dir);
                             }
                             Some(audio_file)
                         }
