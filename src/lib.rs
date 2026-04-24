@@ -295,8 +295,7 @@ impl AudioFile {
                 .unwrap_or(0)
                 <= 1;
 
-        let cached = resume_cache
-            .and_then(|cache| cache.lookup(entry.path(), size, modified_secs));
+        let cached = resume_cache.and_then(|cache| cache.lookup(entry.path(), size, modified_secs));
 
         (is_unique_skip, cached)
     }
@@ -507,7 +506,7 @@ impl AudioFile {
                         Err(err) => {
                             let error_message =
                                 format!("Error processing file: {}: {:?}", path_str, err);
-                            println!("{}", error_message);
+                            eprintln!("{}", error_message);
                             let mut error_log = error_log_file.lock().unwrap();
                             if error_log.is_none() {
                                 *error_log = Some(
@@ -577,7 +576,7 @@ impl AudioFile {
                         Err(err) => {
                             let error_message =
                                 format!("Error processing file: {}: {:?}", path_str, err);
-                            println!("{}", error_message);
+                            eprintln!("{}", error_message);
                             let mut error_log = error_log_file.lock().unwrap();
                             if error_log.is_none() {
                                 *error_log = Some(

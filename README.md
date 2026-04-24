@@ -112,6 +112,12 @@ Inputs may be directories, files, or any combination of both.
 
   * Disable loading and saving of the resume state
 
+* `--format <FORMAT>`
+
+  * Set duplicate result output format
+  * Supported values: `text` (default), `json`
+  * `json` writes a query-friendly duplicate report to stdout
+
 ---
 
 ## Resume behavior
@@ -144,15 +150,41 @@ Files sharing the same characteristics are grouped together as duplicates.
 * **Console**
 
   * Duplicate groups are printed to stdout
+  * Use `--format json` to print duplicate groups as JSON for tools like `jq`
 
 * **Files**
 
   * `identical_files.log`
 
     * Appended with duplicate file paths (grouped)
+    * Written only by the default `text` output format
   * `identical_files_errors.log`
 
     * Created only if errors occur during processing
+
+### Query duplicate output with `jq`
+
+Write a JSON duplicate report:
+
+```bash
+fadupes -i /music --format json > dupes.json
+```
+
+Print only duplicate track paths under one directory:
+
+```bash
+jq -r --arg dir "$(realpath /music/xyz)/" \
+  '.groups[].files[] | select(.file_path | startswith($dir)) | .file_path' \
+  dupes.json
+```
+
+Print every path in duplicate groups that contain at least one file under that directory:
+
+```bash
+jq -r --arg dir "$(realpath /music/xyz)/" \
+  '.groups[] | select(any(.files[].file_path; startswith($dir))) | .files[].file_path' \
+  dupes.json
+```
 
 ---
 

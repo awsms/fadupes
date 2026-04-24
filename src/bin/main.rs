@@ -2,10 +2,80 @@ use clap::{Arg, ArgAction, Command, ValueHint, crate_version, value_parser};
 use ctrlc;
 use fadupes::{AudioFile, ResumeCache, SizeFilter, parse_size_filter};
 use rayon::prelude::*;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+#[derive(Clone, Copy)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize)]
+struct DuplicateSignature {
+    total_samples: u64,
+    sample_rate: u32,
+    bit_depth: u32,
+    channels: u32,
+    peak_level_bits: u32,
+    rms_db_level_bits: u64,
+}
+
+impl DuplicateSignature {
+    fn from_audio_file(file: &AudioFile) -> Self {
+        Self {
+            total_samples: file.total_samples,
+            sample_rate: file.sample_rate,
+            bit_depth: file.bit_depth,
+            channels: file.channels,
+            peak_level_bits: file.peak_level.to_bits(),
+            rms_db_level_bits: file.rms_db_level.to_bits(),
+        }
+    }
+
+    fn id(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{:08x}:{:016x}",
+            self.total_samples,
+            self.sample_rate,
+            self.bit_depth,
+            self.channels,
+            self.peak_level_bits,
+            self.rms_db_level_bits
+        )
+    }
+}
+
+#[derive(Serialize)]
+struct DuplicateGroup<'a> {
+    id: String,
+    signature: DuplicateSignature,
+    files: Vec<&'a AudioFile>,
+}
+
+#[derive(Serialize)]
+struct DuplicateReport<'a> {
+    schema_version: u32,
+    tool: ToolInfo<'a>,
+    summary: DuplicateSummary,
+    groups: Vec<DuplicateGroup<'a>>,
+}
+
+#[derive(Serialize)]
+struct ToolInfo<'a> {
+    name: &'a str,
+    version: &'a str,
+}
+
+#[derive(Serialize)]
+struct DuplicateSummary {
+    scanned_files: usize,
+    duplicate_groups: usize,
+    duplicate_files: usize,
+}
 
 fn main() {
     let matches = Command::new("Audio dupechecker")
@@ -75,6 +145,14 @@ fn main() {
                 .help("Set number of threads used for parallel scanning (default: Rayon default)")
                 .value_parser(value_parser!(usize)),
         )
+        .arg(
+            Arg::new("format")
+                .long("format")
+                .value_name("FORMAT")
+                .help("Set duplicate result output format")
+                .default_value("text")
+                .value_parser(["text", "json"]),
+        )
         .get_matches();
 
     let threads = matches.get_one::<usize>("threads").copied();
@@ -101,6 +179,14 @@ fn main() {
     let skip_unique_size = matches.get_flag("skip_unique_size");
     let ignore_symlinks = matches.get_flag("nosym");
     let no_resume = matches.get_flag("no_resume");
+    let output_format = match matches
+        .get_one::<String>("format")
+        .map(String::as_str)
+        .unwrap_or("text")
+    {
+        "json" => OutputFormat::Json,
+        _ => OutputFormat::Text,
+    };
     let ignore_size_expr = matches.get_one::<String>("ignore_size").cloned();
     let ignore_size: Option<SizeFilter> = ignore_size_expr
         .as_deref()
@@ -165,10 +251,47 @@ fn main() {
         })
         .collect();
 
-    compare_audio_files(&audio_files);
+    compare_audio_files(&audio_files, output_format);
 }
 
-fn compare_audio_files(audio_files: &[AudioFile]) {
+fn compare_audio_files(audio_files: &[AudioFile], output_format: OutputFormat) {
+    let groups = collect_duplicate_groups(audio_files);
+
+    match output_format {
+        OutputFormat::Text => write_text_output(audio_files.len(), &groups),
+        OutputFormat::Json => write_json_output(audio_files.len(), groups),
+    }
+}
+
+fn collect_duplicate_groups(audio_files: &[AudioFile]) -> Vec<DuplicateGroup<'_>> {
+    let mut file_map: HashMap<DuplicateSignature, Vec<&AudioFile>> = HashMap::new();
+
+    for file in audio_files {
+        let key = DuplicateSignature::from_audio_file(file);
+        file_map.entry(key).or_default().push(file);
+    }
+
+    let mut groups: Vec<_> = file_map
+        .into_iter()
+        .filter_map(|(signature, mut files)| {
+            if files.len() <= 1 {
+                return None;
+            }
+
+            files.sort_unstable_by(|a, b| a.file_path.cmp(&b.file_path));
+            Some(DuplicateGroup {
+                id: signature.id(),
+                signature,
+                files,
+            })
+        })
+        .collect();
+
+    groups.sort_unstable_by(|a, b| a.files[0].file_path.cmp(&b.files[0].file_path));
+    groups
+}
+
+fn write_text_output(scanned_files: usize, duplicate_groups: &[DuplicateGroup<'_>]) {
     let log_file_path = "identical_files.log"; // path for the log file (current dir)
 
     // Open the log file in append mode (creates it if not exists), currently it's a simple txt file
@@ -178,57 +301,53 @@ fn compare_audio_files(audio_files: &[AudioFile]) {
         .open(log_file_path)
         .expect("Unable to open log file");
 
-    let mut file_map = HashMap::new();
-    let mut identical_groups = Vec::new();
-
-    // Group files by their characteristics
-    for file in audio_files {
-        // Use bitwise float representation so grouping is exact
-        let key = (
-            file.total_samples,
-            file.sample_rate,
-            file.bit_depth,
-            file.channels,
-            file.peak_level.to_bits(),
-            file.rms_db_level.to_bits(),
-        );
-
-        file_map.entry(key).or_insert_with(Vec::new).push(file);
-    }
-
-    // Collect identical files into groups
-    for (_, files) in &file_map {
-        if files.len() > 1 {
-            identical_groups.push(files);
-        }
-    }
-
     // Output the results and write to the log file
-    if identical_groups.is_empty() {
-        println!("Among {} files, no dupes were found.", audio_files.len());
+    if duplicate_groups.is_empty() {
+        println!("Among {} files, no dupes were found.", scanned_files);
     } else {
-        let total_dupes: usize = identical_groups.iter().map(|g| g.len()).sum();
+        let total_dupes: usize = duplicate_groups.iter().map(|g| g.files.len()).sum();
         println!("Found {} identical files:", total_dupes);
 
         writeln!(log_file, "Identical Files Found:").expect("Failed to write to log file");
         // Avoid logging the same dupe-group more than once in a single run (stable signature = sorted paths)
         let mut seen_groups: HashSet<Vec<String>> = HashSet::new();
 
-        for group in identical_groups {
+        for group in duplicate_groups {
             // stable signature: sorted list of paths
-            let mut sig: Vec<String> = group.iter().map(|f| f.file_path.clone()).collect();
-            sig.sort_unstable();
+            let sig: Vec<String> = group.files.iter().map(|f| f.file_path.clone()).collect();
 
             if !seen_groups.insert(sig) {
                 continue; // already logged this exact set of paths in THIS run
             }
 
             writeln!(log_file, "#").expect("Failed to write to log file"); // Add separator for each dupe group
-            for file in group {
+            for file in &group.files {
                 println!("{}", file.file_path);
                 writeln!(log_file, "{}", file.file_path).expect("Failed to write to log file");
             }
             println!(); // Add an empty line between dupe groups
         }
     }
+}
+
+fn write_json_output(scanned_files: usize, groups: Vec<DuplicateGroup<'_>>) {
+    let duplicate_files = groups.iter().map(|group| group.files.len()).sum();
+    let report = DuplicateReport {
+        schema_version: 1,
+        tool: ToolInfo {
+            name: "fadupes",
+            version: crate_version!(),
+        },
+        summary: DuplicateSummary {
+            scanned_files,
+            duplicate_groups: groups.len(),
+            duplicate_files,
+        },
+        groups,
+    };
+
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    serde_json::to_writer_pretty(&mut stdout, &report).expect("Failed to write JSON output");
+    writeln!(stdout).expect("Failed to write JSON output");
 }
