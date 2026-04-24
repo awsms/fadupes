@@ -1,10 +1,12 @@
 use clap::{Arg, ArgAction, Command, ValueHint, crate_version, value_parser};
 use ctrlc;
-use fadupes::{AudioFile, ResumeCache, SizeFilter, parse_size_filter};
+use fadupes::{AudioFile, CachedEntry, ResumeCache, SizeFilter, parse_size_filter};
 use rayon::prelude::*;
+use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -77,6 +79,28 @@ struct DuplicateSummary {
     duplicate_files: usize,
 }
 
+struct Query {
+    dir: Option<PathBuf>,
+    pattern: Option<Regex>,
+}
+
+impl Query {
+    fn is_active(&self) -> bool {
+        self.dir.is_some() || self.pattern.is_some()
+    }
+
+    fn matches(&self, file: &AudioFile) -> bool {
+        let path = Path::new(&file.file_path);
+        let dir_matches = self.dir.as_ref().is_none_or(|dir| path.starts_with(dir));
+        let pattern_matches = self
+            .pattern
+            .as_ref()
+            .is_none_or(|pattern| pattern.is_match(&file.file_path));
+
+        dir_matches && pattern_matches
+    }
+}
+
 fn main() {
     let matches = Command::new("Audio dupechecker")
         .version(crate_version!())
@@ -87,10 +111,24 @@ fn main() {
                 .short('i')
                 .long("input")
                 .help("Sets the directory to scan for audio files")
-                .required(true)
                 .num_args(1..)
                 .value_hint(ValueHint::FilePath)
                 .value_parser(value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("dir")
+                .long("dir")
+                .value_name("PATH")
+                .help("Query duplicate groups with at least one file under this directory")
+                .value_hint(ValueHint::DirPath)
+                .value_parser(value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("find")
+                .short('f')
+                .long("find")
+                .value_name("PATTERN")
+                .help("Query duplicate groups with at least one file path matching this case-insensitive regex"),
         )
         .arg(
             Arg::new("skip_unique_size")
@@ -108,7 +146,7 @@ fn main() {
             Arg::new("state_file")
                 .long("state-file")
                 .value_hint(ValueHint::FilePath)
-                .help("Path to the resume state file (default: fadupes_state.json)")
+                .help("Path to the resume state file (default: ~/.fadupes_state.json)")
                 .value_parser(value_parser!(PathBuf)),
         )
         .arg(
@@ -170,15 +208,6 @@ fn main() {
             });
     }
 
-    let inputs: Vec<PathBuf> = matches
-        .get_many::<PathBuf>("input")
-        .unwrap()
-        .cloned()
-        .collect();
-    let list_files = !matches.get_flag("nolist");
-    let skip_unique_size = matches.get_flag("skip_unique_size");
-    let ignore_symlinks = matches.get_flag("nosym");
-    let no_resume = matches.get_flag("no_resume");
     let output_format = match matches
         .get_one::<String>("format")
         .map(String::as_str)
@@ -187,6 +216,23 @@ fn main() {
         "json" => OutputFormat::Json,
         _ => OutputFormat::Text,
     };
+    let inputs: Vec<PathBuf> = matches
+        .get_many::<PathBuf>("input")
+        .map(|paths| paths.cloned().collect())
+        .unwrap_or_default();
+    let query = build_query(
+        matches.get_one::<PathBuf>("dir").cloned(),
+        matches.get_one::<String>("find").cloned(),
+    );
+    if inputs.is_empty() && !query.is_active() {
+        eprintln!("Either --input/-i, --dir, or --find/-f is required");
+        std::process::exit(2);
+    }
+
+    let list_files = !matches.get_flag("nolist") && !matches!(output_format, OutputFormat::Json);
+    let skip_unique_size = matches.get_flag("skip_unique_size");
+    let ignore_symlinks = matches.get_flag("nosym");
+    let no_resume = matches.get_flag("no_resume");
     let ignore_size_expr = matches.get_one::<String>("ignore_size").cloned();
     let ignore_size: Option<SizeFilter> = ignore_size_expr
         .as_deref()
@@ -205,15 +251,17 @@ fn main() {
     }
     let provided_state_file = matches.get_one::<PathBuf>("state_file").cloned();
     let resume_enabled = !no_resume;
-    let state_file = provided_state_file.unwrap_or_else(|| PathBuf::from("fadupes_state.json"));
-    let resume_cache = if resume_enabled {
-        Some(Arc::new(ResumeCache::load(state_file, checkpoint)))
+    let state_file = provided_state_file.unwrap_or_else(default_state_file);
+    let resume_cache = if resume_enabled && !inputs.is_empty() {
+        Some(Arc::new(ResumeCache::load(state_file.clone(), checkpoint)))
     } else {
         None
     };
 
     // If resume is enabled, trap Ctrl+C so we can persist the cache before exiting (130 = SIGINT)
-    if let Some(cache) = resume_cache.as_ref() {
+    if !inputs.is_empty()
+        && let Some(cache) = resume_cache.as_ref()
+    {
         let cache_for_signal = Arc::clone(cache);
         ctrlc::set_handler(move || {
             let _ = cache_for_signal.save();
@@ -226,11 +274,75 @@ fn main() {
         .expect("Error setting Ctrl+C handler");
     }
 
+    let write_log = !inputs.is_empty() && !query.is_active();
+    let audio_files = if inputs.is_empty() {
+        load_audio_files_from_state(&state_file)
+    } else {
+        scan_audio_files(
+            inputs,
+            list_files,
+            skip_unique_size,
+            ignore_symlinks,
+            resume_cache,
+            ignore_size.as_ref(),
+        )
+    };
+
+    compare_audio_files(&audio_files, output_format, &query, write_log);
+}
+
+fn default_state_file() -> PathBuf {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".fadupes_state.json"))
+        .unwrap_or_else(|| PathBuf::from("fadupes_state.json"))
+}
+
+fn build_query(dir: Option<PathBuf>, pattern: Option<String>) -> Query {
+    let dir = dir.map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir));
+    let pattern = pattern.map(|pattern| {
+        RegexBuilder::new(&pattern)
+            .case_insensitive(true)
+            .build()
+            .unwrap_or_else(|err| {
+                eprintln!("--find regex parse error: {err}");
+                std::process::exit(2);
+            })
+    });
+
+    Query { dir, pattern }
+}
+
+fn load_audio_files_from_state(path: &Path) -> Vec<AudioFile> {
+    let file = std::fs::File::open(path).unwrap_or_else(|err| {
+        eprintln!("Failed to open state file {}: {err}", path.display());
+        std::process::exit(1);
+    });
+    let entries: HashMap<String, CachedEntry> =
+        serde_json::from_reader(file).unwrap_or_else(|err| {
+            eprintln!("Failed to parse state file {}: {err}", path.display());
+            std::process::exit(1);
+        });
+
+    entries
+        .into_values()
+        .map(|entry| entry.audio_file)
+        .collect()
+}
+
+fn scan_audio_files(
+    inputs: Vec<PathBuf>,
+    list_files: bool,
+    skip_unique_size: bool,
+    ignore_symlinks: bool,
+    resume_cache: Option<Arc<ResumeCache>>,
+    ignore_size: Option<&SizeFilter>,
+) -> Vec<AudioFile> {
     // Create a HashSet of scanned directories to pass to the walk_dir function
     let scanned_dirs: HashSet<PathBuf> = inputs.iter().cloned().collect();
 
     // Collect all the audio files from all inputs
-    let audio_files: Vec<AudioFile> = inputs
+    inputs
         .into_par_iter() // Process directories in parallel
         .flat_map(|input| {
             let full_path = std::fs::canonicalize(&input).unwrap_or_else(|e| {
@@ -245,20 +357,23 @@ fn main() {
                 skip_unique_size,
                 ignore_symlinks,
                 resume_cache.clone(),
-                ignore_size.as_ref(),
+                ignore_size,
             )
             .into_par_iter()
         })
-        .collect();
-
-    compare_audio_files(&audio_files, output_format);
+        .collect()
 }
 
-fn compare_audio_files(audio_files: &[AudioFile], output_format: OutputFormat) {
-    let groups = collect_duplicate_groups(audio_files);
+fn compare_audio_files(
+    audio_files: &[AudioFile],
+    output_format: OutputFormat,
+    query: &Query,
+    write_log: bool,
+) {
+    let groups = filter_duplicate_groups(collect_duplicate_groups(audio_files), query);
 
     match output_format {
-        OutputFormat::Text => write_text_output(audio_files.len(), &groups),
+        OutputFormat::Text => write_text_output(audio_files.len(), &groups, write_log),
         OutputFormat::Json => write_json_output(audio_files.len(), groups),
     }
 }
@@ -291,16 +406,25 @@ fn collect_duplicate_groups(audio_files: &[AudioFile]) -> Vec<DuplicateGroup<'_>
     groups
 }
 
-fn write_text_output(scanned_files: usize, duplicate_groups: &[DuplicateGroup<'_>]) {
-    let log_file_path = "identical_files.log"; // path for the log file (current dir)
+fn filter_duplicate_groups<'a>(
+    groups: Vec<DuplicateGroup<'a>>,
+    query: &Query,
+) -> Vec<DuplicateGroup<'a>> {
+    if !query.is_active() {
+        return groups;
+    }
 
-    // Open the log file in append mode (creates it if not exists), currently it's a simple txt file
-    let mut log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file_path)
-        .expect("Unable to open log file");
+    groups
+        .into_iter()
+        .filter(|group| group.files.iter().any(|file| query.matches(file)))
+        .collect()
+}
 
+fn write_text_output(
+    scanned_files: usize,
+    duplicate_groups: &[DuplicateGroup<'_>],
+    write_log: bool,
+) {
     // Output the results and write to the log file
     if duplicate_groups.is_empty() {
         println!("Among {} files, no dupes were found.", scanned_files);
@@ -308,7 +432,22 @@ fn write_text_output(scanned_files: usize, duplicate_groups: &[DuplicateGroup<'_
         let total_dupes: usize = duplicate_groups.iter().map(|g| g.files.len()).sum();
         println!("Found {} identical files:", total_dupes);
 
-        writeln!(log_file, "Identical Files Found:").expect("Failed to write to log file");
+        let mut log_file = if write_log {
+            let log_file_path = "identical_files.log"; // path for the log file (current dir)
+            Some(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log_file_path)
+                    .expect("Unable to open log file"),
+            )
+        } else {
+            None
+        };
+        if let Some(log_file) = log_file.as_mut() {
+            writeln!(log_file, "Identical Files Found:").expect("Failed to write to log file");
+        }
+
         // Avoid logging the same dupe-group more than once in a single run (stable signature = sorted paths)
         let mut seen_groups: HashSet<Vec<String>> = HashSet::new();
 
@@ -320,10 +459,14 @@ fn write_text_output(scanned_files: usize, duplicate_groups: &[DuplicateGroup<'_
                 continue; // already logged this exact set of paths in THIS run
             }
 
-            writeln!(log_file, "#").expect("Failed to write to log file"); // Add separator for each dupe group
+            if let Some(log_file) = log_file.as_mut() {
+                writeln!(log_file, "#").expect("Failed to write to log file"); // Add separator for each dupe group
+            }
             for file in &group.files {
                 println!("{}", file.file_path);
-                writeln!(log_file, "{}", file.file_path).expect("Failed to write to log file");
+                if let Some(log_file) = log_file.as_mut() {
+                    writeln!(log_file, "{}", file.file_path).expect("Failed to write to log file");
+                }
             }
             println!(); // Add an empty line between dupe groups
         }

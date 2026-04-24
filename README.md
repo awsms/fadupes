@@ -55,19 +55,30 @@ target/release/fadupes
 fadupes -i <path>
 fadupes -i <directory1> <directory2>
 fadupes -i <file1> <file2>
+fadupes --dir <directory>
+fadupes -f <pattern>
 ```
 
 Inputs may be directories, files, or any combination of both.
+Without `-i`, query options read the global resume state.
 
 ---
 
 ## Command-line options
 
-### Required
-
 * `-i, --input <PATHS...>`
 
   * One or more files or directories to scan
+
+* `--dir <PATH>`
+
+  * Query duplicate groups with at least one file under this directory
+  * Returns whole duplicate groups, not only the matching file
+
+* `-f, --find <PATTERN>`
+
+  * Query duplicate groups with at least one file path matching this case-insensitive regex
+  * Returns whole duplicate groups, not only the matching file
 
 ### Optional
 
@@ -106,7 +117,7 @@ Inputs may be directories, files, or any combination of both.
 * `--state-file <PATH>`
 
   * Path to the resume state file
-  * Default: `fadupes_state.json`
+  * Default: `~/.fadupes_state.json`
 
 * `--no-resume`
 
@@ -122,10 +133,11 @@ Inputs may be directories, files, or any combination of both.
 
 ## Resume behavior
 
-* State files are written in the current working directory by default
+* State files are written to `~/.fadupes_state.json` by default
 * If the state file exists, it is loaded automatically
 * The state is saved periodically during the scan (tune with `--checkpoint`)
 * On Ctrl+C, the state is saved before exiting
+* Query mode (`--dir` / `--find`) reads the state file without scanning
 
 ---
 
@@ -157,7 +169,7 @@ Files sharing the same characteristics are grouped together as duplicates.
   * `identical_files.log`
 
     * Appended with duplicate file paths (grouped)
-    * Written only by the default `text` output format
+    * Written only by default text scan output, not query output
   * `identical_files_errors.log`
 
     * Created only if errors occur during processing
@@ -184,6 +196,20 @@ Print every path in duplicate groups that contain at least one file under that d
 jq -r --arg dir "$(realpath /music/xyz)/" \
   '.groups[] | select(any(.files[].file_path; startswith($dir))) | .files[].file_path' \
   dupes.json
+```
+
+### Query the global state
+
+Print duplicate groups where any file is under a directory:
+
+```bash
+fadupes --dir /music/xyz
+```
+
+Print duplicate groups where any path matches a case-insensitive regex:
+
+```bash
+fadupes -f charrette
 ```
 
 ---
