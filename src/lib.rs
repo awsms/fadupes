@@ -9,6 +9,8 @@ use std::fs::File;
 use std::fs::read_link;
 use std::io::ErrorKind;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -161,6 +163,49 @@ pub struct CachedEntry {
     pub modified_secs: u64,
 }
 
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
+enum FileIdentity {
+    #[cfg(unix)]
+    Unix { dev: u64, ino: u64 },
+    #[cfg(not(unix))]
+    CanonicalPath(PathBuf),
+}
+
+impl FileIdentity {
+    fn from_path(_path: &Path, metadata: &std::fs::Metadata) -> Option<Self> {
+        #[cfg(unix)]
+        {
+            Some(Self::Unix {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::fs::canonicalize(_path).ok().map(Self::CanonicalPath)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SeenFiles {
+    data: Arc<Mutex<HashSet<FileIdentity>>>,
+}
+
+impl SeenFiles {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn insert(&self, identity: FileIdentity) -> bool {
+        self.data
+            .lock()
+            .map(|mut seen| seen.insert(identity))
+            .unwrap_or(true)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResumeCache {
     pub path: PathBuf,
@@ -278,10 +323,17 @@ impl Drop for ResumeCache {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AudioCandidate {
+    path: PathBuf,
+    file_size: u64,
+    modified_secs: u64,
+}
+
 impl AudioFile {
     // Shared helper: decide if an entry should be skipped (unique size) or served from cache.
     fn skip_or_cached(
-        entry: &walkdir::DirEntry,
+        path: &Path,
         size: u64,
         modified_secs: u64,
         skip_unique_size: bool,
@@ -295,7 +347,7 @@ impl AudioFile {
                 .unwrap_or(0)
                 <= 1;
 
-        let cached = resume_cache.and_then(|cache| cache.lookup(entry.path(), size, modified_secs));
+        let cached = resume_cache.and_then(|cache| cache.lookup(path, size, modified_secs));
 
         (is_unique_skip, cached)
     }
@@ -309,6 +361,7 @@ impl AudioFile {
         ignore_symlinks: bool,
         resume_cache: Option<Arc<ResumeCache>>,
         ignore_size: Option<&SizeFilter>,
+        seen_files: SeenFiles,
     ) -> Vec<AudioFile> {
         // Lazily open the error log only if we hit an error (shared across threads via Mutex<Option<File>>)
         let error_log_file: Arc<Mutex<Option<File>>> = Arc::new(Mutex::new(None));
@@ -316,7 +369,7 @@ impl AudioFile {
         // Collect the list of audio files to process
         // Build the full candidate list up front; we need it to compute unique-size skips
         // and to seed the progress bar with already-cached or skipped entries on resume.
-        let files_to_process: Vec<_> = WalkDir::new(dir)
+        let files_to_process: Vec<AudioCandidate> = WalkDir::new(dir)
             .follow_links(!ignore_symlinks) // Follow symlinks by default; skip loop-back symlinks into input roots (and skip all symlinks if --nosym is set)
             .sort_by_file_name()
             .into_iter()
@@ -324,17 +377,19 @@ impl AudioFile {
             .filter_map(|f| {
                 let path = f.path();
 
-                if f.file_type().is_symlink() {
+                if f.path_is_symlink() {
                     if ignore_symlinks {
                         return None;
                     }
 
                     // Check if it's a symlink and resolve it
-                    if let Ok(symlink_target) = read_link(path) {
-                        // If symlink points to one of the directories being scanned, ignore it
+                    if let Ok(symlink_target) =
+                        std::fs::canonicalize(path).or_else(|_| read_link(path))
+                    {
+                        // If symlink points directly to one of the scan roots, ignore it
                         if scanned_dirs.contains(&symlink_target) {
                             eprintln!(
-                                "Skipping symlink pointing to a scanned dir: {}",
+                                "Skipping symlink pointing to a scanned input: {}",
                                 path.display()
                             );
                             return None;
@@ -342,9 +397,18 @@ impl AudioFile {
                     }
                 }
 
-                let Ok(metadata) = std::fs::metadata(f.path()) else {
+                let file_path = if f.path_is_symlink() {
+                    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+                } else {
+                    path.to_path_buf()
+                };
+
+                let Ok(metadata) = std::fs::metadata(&file_path) else {
                     return None;
                 };
+                if !metadata.is_file() {
+                    return None;
+                }
 
                 let size = metadata.len();
                 // Apply optional ignore filter from --ignore-size
@@ -355,19 +419,27 @@ impl AudioFile {
                 let size_ok = metadata.len() <= 800 * 1024 * 1024; // Check if file is <= 800MB
 
                 // Filter by file extension (flac or wav) and file size
-                let Some(extension) = f.path().extension() else {
+                let Some(extension) = file_path.extension() else {
                     return None;
                 };
 
                 if (extension == "flac" || extension == "wav") && size_ok {
-                    let size = metadata.len();
                     let modified_secs = metadata
                         .modified()
                         .ok()
                         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    Some((f, size, modified_secs))
+                    let identity = FileIdentity::from_path(&file_path, &metadata)?;
+                    if !seen_files.insert(identity) {
+                        return None;
+                    }
+
+                    Some(AudioCandidate {
+                        path: file_path,
+                        file_size: size,
+                        modified_secs,
+                    })
                 } else {
                     None
                 }
@@ -377,8 +449,8 @@ impl AudioFile {
         // Precompute size counts if we need to skip unique sizes
         let size_counts = if skip_unique_size {
             let mut counts = std::collections::HashMap::new();
-            for (_, size, _) in &files_to_process {
-                *counts.entry(*size).or_insert(0usize) += 1;
+            for candidate in &files_to_process {
+                *counts.entry(candidate.file_size).or_insert(0usize) += 1;
             }
             Some(counts)
         } else {
@@ -388,11 +460,11 @@ impl AudioFile {
         // Count how many entries are already satisfied (cached) or will be skipped (unique size)
         let initial_processed = files_to_process
             .iter()
-            .filter(|(entry, size, modified_secs)| {
+            .filter(|candidate| {
                 let (is_unique_skip, cached) = Self::skip_or_cached(
-                    entry,
-                    *size,
-                    *modified_secs,
+                    &candidate.path,
+                    candidate.file_size,
+                    candidate.modified_secs,
                     skip_unique_size,
                     size_counts.as_ref(),
                     resume_cache.as_ref(),
@@ -448,14 +520,14 @@ impl AudioFile {
             );
             files_to_process
                 .par_iter()
-                .filter_map(|(entry, size, modified_secs)| {
-                    let path_str = entry.path().to_string_lossy().to_string();
+                .filter_map(|candidate| {
+                    let path_str = candidate.path.to_string_lossy().to_string();
                     let progress = progress_bar.clone();
 
                     let (is_unique_skip, cached) = Self::skip_or_cached(
-                        entry,
-                        *size,
-                        *modified_secs,
+                        &candidate.path,
+                        candidate.file_size,
+                        candidate.modified_secs,
                         skip_unique_size,
                         size_counts.as_ref(),
                         resume_cache.as_ref(),
@@ -466,7 +538,7 @@ impl AudioFile {
                         if let Some(ref mp) = list_mp {
                             let _ = mp.println(format!(
                                 "Skipping unique-size file: {}",
-                                entry.path().display()
+                                candidate.path.display()
                             ));
                         }
                         return None;
@@ -476,7 +548,7 @@ impl AudioFile {
                         if let Some(ref mp) = list_mp {
                             let _ = mp.println(format!(
                                 "Using cached result for: {}",
-                                entry.path().display()
+                                candidate.path.display()
                             ));
                         }
                         if !already_processed {
@@ -494,12 +566,16 @@ impl AudioFile {
                         Some(pb.clone())
                     };
 
-                    let result = match AudioFile::process_audio_file(entry) {
+                    let result = match AudioFile::process_audio_path(&candidate.path) {
                         Ok(mut audio_file) => {
-                            audio_file.file_size = *size;
-                            audio_file.modified_secs = *modified_secs;
+                            audio_file.file_size = candidate.file_size;
+                            audio_file.modified_secs = candidate.modified_secs;
                             if let Some(cache) = resume_cache.as_ref() {
-                                cache.store(audio_file.clone(), *size, *modified_secs);
+                                cache.store(
+                                    audio_file.clone(),
+                                    candidate.file_size,
+                                    candidate.modified_secs,
+                                );
                             }
                             Some(audio_file)
                         }
@@ -539,14 +615,14 @@ impl AudioFile {
         } else {
             files_to_process
                 .par_iter()
-                .filter_map(|(entry, size, modified_secs)| {
-                    let path_str = entry.path().to_string_lossy().to_string();
+                .filter_map(|candidate| {
+                    let path_str = candidate.path.to_string_lossy().to_string();
                     let progress = progress_bar.clone();
 
                     let (is_unique_skip, cached) = Self::skip_or_cached(
-                        entry,
-                        *size,
-                        *modified_secs,
+                        &candidate.path,
+                        candidate.file_size,
+                        candidate.modified_secs,
                         skip_unique_size,
                         size_counts.as_ref(),
                         resume_cache.as_ref(),
@@ -564,12 +640,16 @@ impl AudioFile {
                         return Some(audio_file);
                     }
 
-                    let result = match AudioFile::process_audio_file(entry) {
+                    let result = match AudioFile::process_audio_path(&candidate.path) {
                         Ok(mut audio_file) => {
-                            audio_file.file_size = *size;
-                            audio_file.modified_secs = *modified_secs;
+                            audio_file.file_size = candidate.file_size;
+                            audio_file.modified_secs = candidate.modified_secs;
                             if let Some(cache) = resume_cache.as_ref() {
-                                cache.store(audio_file.clone(), *size, *modified_secs);
+                                cache.store(
+                                    audio_file.clone(),
+                                    candidate.file_size,
+                                    candidate.modified_secs,
+                                );
                             }
                             Some(audio_file)
                         }
@@ -613,19 +693,19 @@ impl AudioFile {
 
     // Process individual audio files (FLAC and WAV)
     pub fn process_audio_file(entry: &walkdir::DirEntry) -> Result<AudioFile, ProcessError> {
-        let extension = entry
-            .path()
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("");
+        Self::process_audio_path(entry.path())
+    }
+
+    pub fn process_audio_path(path: &Path) -> Result<AudioFile, ProcessError> {
+        let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
         let mut audio_file = AudioFile {
-            file_path: entry.path().to_string_lossy().to_string(), // Store the full path
+            file_path: path.to_string_lossy().to_string(), // Store the full path
             ..Default::default()
         };
 
         match extension {
             "flac" => {
-                let mut reader = Self::load_flac(entry.path())?;
+                let mut reader = Self::load_flac(path)?;
                 let stream_info = reader.streaminfo();
                 let total_samples = stream_info.samples.ok_or(ProcessError::NoSamplesFound)?;
                 audio_file.total_samples = total_samples;
@@ -641,8 +721,7 @@ impl AudioFile {
                 audio_file.rms_db_level = clean_rms_db_level(rms_db_level);
             }
             "wav" => {
-                let mut reader =
-                    WavReader::open(entry.path()).map_err(|_| ProcessError::NonFlacError)?;
+                let mut reader = WavReader::open(path).map_err(|_| ProcessError::NonFlacError)?;
                 let spec = reader.spec();
                 audio_file.total_samples = reader.duration() as u64;
                 audio_file.sample_rate = spec.sample_rate;

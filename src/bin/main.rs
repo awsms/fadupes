@@ -1,6 +1,6 @@
 use clap::{Arg, ArgAction, Command, ValueHint, crate_version, value_parser};
 use ctrlc;
-use fadupes::{AudioFile, CachedEntry, ResumeCache, SizeFilter, parse_size_filter};
+use fadupes::{AudioFile, CachedEntry, ResumeCache, SeenFiles, SizeFilter, parse_size_filter};
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
@@ -339,17 +339,24 @@ fn scan_audio_files(
     ignore_size: Option<&SizeFilter>,
 ) -> Vec<AudioFile> {
     // Create a HashSet of scanned directories to pass to the walk_dir function
-    let scanned_dirs: HashSet<PathBuf> = inputs.iter().cloned().collect();
+    let mut unique_inputs = Vec::new();
+    let mut scanned_dirs = HashSet::new();
+    for input in inputs {
+        let full_path = std::fs::canonicalize(&input).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        });
+        if scanned_dirs.insert(full_path.clone()) {
+            unique_inputs.push(full_path);
+        }
+    }
+
+    let seen_files = SeenFiles::new();
 
     // Collect all the audio files from all inputs
-    inputs
+    unique_inputs
         .into_par_iter() // Process directories in parallel
-        .flat_map(|input| {
-            let full_path = std::fs::canonicalize(&input).unwrap_or_else(|e| {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            });
-
+        .flat_map(|full_path| {
             AudioFile::walk_dir(
                 &full_path,
                 &scanned_dirs,
@@ -358,6 +365,7 @@ fn scan_audio_files(
                 ignore_symlinks,
                 resume_cache.clone(),
                 ignore_size,
+                seen_files.clone(),
             )
             .into_par_iter()
         })

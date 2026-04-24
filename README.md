@@ -21,7 +21,8 @@
 - **Symlink handling**
   - Follows symlinks by default
   - Option to ignore symlinks
-  - Avoids loop-back symlinks into scanned roots
+  - Avoids scanning the same physical file more than once
+  - Reports the resolved target path for symlinked audio files
 - **Filtering options**
   - Ignore files by size (`<`, `>`, or range)
   - Skip files with a unique byte size for faster scans
@@ -138,6 +139,16 @@ Without `-i`, query options read the global resume state.
 * The state is saved periodically during the scan (tune with `--checkpoint`)
 * On Ctrl+C, the state is saved before exiting
 * Query mode (`--dir` / `--find`) reads the state file without scanning
+
+---
+
+## Symlink behavior
+
+By default, `fadupes` follows symlinks. When a symlink resolves to an audio file, the resolved target path is stored and reported instead of the symlink path.
+
+During a scan, `fadupes` tracks physical files it has already seen. On Unix this uses `(device, inode)`, so hardlinks and multiple symlinks to the same file are not decoded twice. On other platforms, canonical paths are used as the fallback identity.
+
+Use `--nosym` to ignore symlinks completely.
 
 ---
 
