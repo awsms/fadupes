@@ -156,11 +156,117 @@ impl Default for AudioFile {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CachedEntry {
-    pub audio_file: AudioFile,
+    pub total_samples: u64,
+    pub sample_rate: u32,
+    pub bit_depth: u32,
+    pub channels: u32,
+    pub peak_level: f32,
+    pub rms_db_level: f64,
     pub file_size: u64,
     pub modified_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CurrentCachedEntry {
+    total_samples: u64,
+    sample_rate: u32,
+    bit_depth: u32,
+    channels: u32,
+    peak_level: f32,
+    #[serde(
+        default = "default_rms_db_level",
+        deserialize_with = "deserialize_rms_db_level"
+    )]
+    rms_db_level: f64,
+    file_size: u64,
+    modified_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyCachedEntry {
+    audio_file: AudioFile,
+    file_size: u64,
+    modified_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CachedEntryFormat {
+    Current(CurrentCachedEntry),
+    Legacy(LegacyCachedEntry),
+}
+
+impl CachedEntry {
+    pub fn from_audio_file(audio_file: &AudioFile, file_size: u64, modified_secs: u64) -> Self {
+        Self {
+            total_samples: audio_file.total_samples,
+            sample_rate: audio_file.sample_rate,
+            bit_depth: audio_file.bit_depth,
+            channels: audio_file.channels,
+            peak_level: audio_file.peak_level,
+            rms_db_level: audio_file.rms_db_level,
+            file_size,
+            modified_secs,
+        }
+    }
+
+    pub fn to_audio_file(&self, file_path: String) -> AudioFile {
+        AudioFile {
+            file_path,
+            total_samples: self.total_samples,
+            sample_rate: self.sample_rate,
+            bit_depth: self.bit_depth,
+            channels: self.channels,
+            peak_level: self.peak_level,
+            rms_db_level: self.rms_db_level,
+            file_size: self.file_size,
+            modified_secs: self.modified_secs,
+        }
+    }
+}
+
+impl From<CurrentCachedEntry> for CachedEntry {
+    fn from(entry: CurrentCachedEntry) -> Self {
+        Self {
+            total_samples: entry.total_samples,
+            sample_rate: entry.sample_rate,
+            bit_depth: entry.bit_depth,
+            channels: entry.channels,
+            peak_level: entry.peak_level,
+            rms_db_level: entry.rms_db_level,
+            file_size: entry.file_size,
+            modified_secs: entry.modified_secs,
+        }
+    }
+}
+
+impl From<LegacyCachedEntry> for CachedEntry {
+    fn from(entry: LegacyCachedEntry) -> Self {
+        Self {
+            total_samples: entry.audio_file.total_samples,
+            sample_rate: entry.audio_file.sample_rate,
+            bit_depth: entry.audio_file.bit_depth,
+            channels: entry.audio_file.channels,
+            peak_level: entry.audio_file.peak_level,
+            rms_db_level: entry.audio_file.rms_db_level,
+            file_size: entry.file_size,
+            modified_secs: entry.modified_secs,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CachedEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match CachedEntryFormat::deserialize(deserializer)? {
+            CachedEntryFormat::Current(entry) => entry.into(),
+            CachedEntryFormat::Legacy(entry) => entry.into(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Eq, Hash, PartialEq)]
@@ -260,26 +366,22 @@ impl ResumeCache {
         file_size: u64,
         modified_secs: u64,
     ) -> Option<AudioFile> {
+        let path_key = file_path.to_string_lossy().to_string();
         let map = self.data.lock().ok()?;
-        map.get(&file_path.to_string_lossy().to_string())
-            .and_then(|entry| {
-                if entry.file_size == file_size && entry.modified_secs == modified_secs {
-                    Some(entry.audio_file.clone())
-                } else {
-                    None
-                }
-            })
+        map.get(&path_key).and_then(|entry| {
+            if entry.file_size == file_size && entry.modified_secs == modified_secs {
+                Some(entry.to_audio_file(path_key))
+            } else {
+                None
+            }
+        })
     }
 
     pub fn store(&self, audio_file: AudioFile, file_size: u64, modified_secs: u64) {
         if let Ok(mut map) = self.data.lock() {
             map.insert(
                 audio_file.file_path.clone(),
-                CachedEntry {
-                    audio_file,
-                    file_size,
-                    modified_secs,
-                },
+                CachedEntry::from_audio_file(&audio_file, file_size, modified_secs),
             );
         }
 
@@ -870,5 +972,72 @@ fn backup_broken(path: &Path, reason: &str) {
             reason,
             err
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_audio_file() -> AudioFile {
+        AudioFile {
+            file_path: "/music/example.flac".to_string(),
+            total_samples: 12345,
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            peak_level: 0.75,
+            rms_db_level: -12.5,
+            file_size: 98765,
+            modified_secs: 1234567890,
+        }
+    }
+
+    #[test]
+    fn cached_entry_serializes_without_path_or_audio_file_wrapper() {
+        let audio_file = sample_audio_file();
+        let entry = CachedEntry::from_audio_file(
+            &audio_file,
+            audio_file.file_size,
+            audio_file.modified_secs,
+        );
+
+        let value = serde_json::to_value(&entry).unwrap();
+
+        assert!(value.get("audio_file").is_none());
+        assert!(value.get("file_path").is_none());
+        assert_eq!(value["total_samples"], json!(12345));
+        assert_eq!(value["file_size"], json!(98765));
+        assert_eq!(value["modified_secs"], json!(1234567890));
+    }
+
+    #[test]
+    fn cached_entry_reads_legacy_nested_format() {
+        let value = json!({
+            "audio_file": {
+                "file_path": "/legacy/example.flac",
+                "total_samples": 456,
+                "sample_rate": 48000,
+                "bit_depth": 24,
+                "channels": 2,
+                "peak_level": 0.5,
+                "rms_db_level": -8.25,
+                "file_size": 111,
+                "modified_secs": 222
+            },
+            "file_size": 333,
+            "modified_secs": 444
+        });
+
+        let entry: CachedEntry = serde_json::from_value(value).unwrap();
+        let audio_file = entry.to_audio_file("/legacy/example.flac".to_string());
+
+        assert_eq!(audio_file.file_path, "/legacy/example.flac");
+        assert_eq!(audio_file.total_samples, 456);
+        assert_eq!(audio_file.sample_rate, 48000);
+        assert_eq!(audio_file.bit_depth, 24);
+        assert_eq!(audio_file.file_size, 333);
+        assert_eq!(audio_file.modified_secs, 444);
     }
 }

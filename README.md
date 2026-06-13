@@ -139,6 +139,7 @@ Without `-i`, query options read the global resume state.
 * The state is saved periodically during the scan (tune with `--checkpoint`)
 * On Ctrl+C, the state is saved before exiting
 * Query mode (`--dir` / `--find`) reads the state file without scanning
+* State entries are keyed by file path; values contain the decoded audio metrics plus size/mtime validation metadata
 
 ---
 

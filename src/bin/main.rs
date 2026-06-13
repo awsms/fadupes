@@ -325,8 +325,8 @@ fn load_audio_files_from_state(path: &Path) -> Vec<AudioFile> {
         });
 
     entries
-        .into_values()
-        .map(|entry| entry.audio_file)
+        .into_iter()
+        .map(|(file_path, entry)| entry.to_audio_file(file_path))
         .collect()
 }
 
