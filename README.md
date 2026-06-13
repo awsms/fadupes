@@ -135,7 +135,7 @@ Without `-i`, query options read the global resume state.
 
 * `--dry-run`
 
-  * Show how many state entries `--cleanup` would remove without writing the state file
+  * List the state entries `--cleanup` would remove and show the total without writing the state file
 
 * `--format <FORMAT>`
 
@@ -153,8 +153,8 @@ Without `-i`, query options read the global resume state.
 * On Ctrl+C, the state is saved before exiting
 * Query mode (`--dir` / `--find`) reads the state file without scanning
 * State entries are keyed by file path; values contain the decoded audio metrics plus size/mtime validation metadata
-* `--cleanup --dry-run` reports stale entries without changing the state file
-* `--cleanup` removes stale state entries for files that no longer exist
+* `--cleanup --dry-run` lists stale entries without changing the state file
+* `--cleanup` lists and removes stale state entries for files that no longer exist
 
 ---
 

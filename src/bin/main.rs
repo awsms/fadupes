@@ -351,11 +351,17 @@ fn cleanup_state_file(state_file: &Path, inputs: &[PathBuf], checkpoint: usize, 
     };
 
     if dry_run {
+        for file_path in &report.stale_paths {
+            println!("Would remove stale state entry: {file_path}");
+        }
         println!(
             "Dry run: would remove {} stale state entries from {} (checked {}). No files would be deleted.",
             report.stale_entries, scope, report.checked_entries
         );
     } else {
+        for file_path in &report.stale_paths {
+            println!("Removed stale state entry: {file_path}");
+        }
         println!(
             "Removed {} stale state entries from {} (checked {}). No audio files were deleted.",
             report.stale_entries, scope, report.checked_entries

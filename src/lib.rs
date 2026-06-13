@@ -442,7 +442,7 @@ impl ResumeCache {
         roots: &[PathBuf],
         dry_run: bool,
     ) -> std::io::Result<CleanupReport> {
-        let (checked_entries, stale_keys) = {
+        let (checked_entries, mut stale_keys) = {
             let map = self.data.lock().unwrap();
             let mut checked_entries = 0usize;
             let mut stale_keys = Vec::new();
@@ -462,12 +462,14 @@ impl ResumeCache {
             (checked_entries, stale_keys)
         };
 
+        stale_keys.sort_unstable();
+
         let stale_entries = stale_keys.len();
         if !dry_run && stale_entries > 0 {
             {
                 let mut map = self.data.lock().unwrap();
-                for key in stale_keys {
-                    map.remove(&key);
+                for key in &stale_keys {
+                    map.remove(key);
                 }
             }
             self.save()?;
@@ -476,6 +478,7 @@ impl ResumeCache {
         Ok(CleanupReport {
             checked_entries,
             stale_entries,
+            stale_paths: stale_keys,
         })
     }
 }
@@ -488,10 +491,11 @@ impl Drop for ResumeCache {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct CleanupReport {
     pub checked_entries: usize,
     pub stale_entries: usize,
+    pub stale_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1154,6 +1158,7 @@ mod tests {
             CleanupReport {
                 checked_entries: 2,
                 stale_entries: 1,
+                stale_paths: vec![missing_path.to_string_lossy().to_string()],
             }
         );
         assert_eq!(cache.data.lock().unwrap().len(), 3);
@@ -1166,6 +1171,7 @@ mod tests {
             CleanupReport {
                 checked_entries: 2,
                 stale_entries: 1,
+                stale_paths: vec![missing_path.to_string_lossy().to_string()],
             }
         );
 
