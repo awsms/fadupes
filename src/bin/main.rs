@@ -162,6 +162,20 @@ fn main() {
                 .help("Disable resuming from / saving to the state file"),
         )
         .arg(
+            Arg::new("cleanup")
+                .long("cleanup")
+                .action(ArgAction::SetTrue)
+                .conflicts_with_all(["dir", "find", "no_resume"])
+                .help("Remove state entries for files that no longer exist, then exit"),
+        )
+        .arg(
+            Arg::new("dry_run")
+                .long("dry-run")
+                .action(ArgAction::SetTrue)
+                .requires("cleanup")
+                .help("Show how many state entries --cleanup would remove without writing the state file"),
+        )
+        .arg(
             Arg::new("ignore_size")
                 .long("ignore-size")
                 .value_name("EXPR")
@@ -224,10 +238,8 @@ fn main() {
         matches.get_one::<PathBuf>("dir").cloned(),
         matches.get_one::<String>("find").cloned(),
     );
-    if inputs.is_empty() && !query.is_active() {
-        eprintln!("Either --input/-i, --dir, or --find/-f is required");
-        std::process::exit(2);
-    }
+    let cleanup = matches.get_flag("cleanup");
+    let dry_run = matches.get_flag("dry_run");
 
     let list_files = !matches.get_flag("nolist") && !matches!(output_format, OutputFormat::Json);
     let skip_unique_size = matches.get_flag("skip_unique_size");
@@ -252,6 +264,16 @@ fn main() {
     let provided_state_file = matches.get_one::<PathBuf>("state_file").cloned();
     let resume_enabled = !no_resume;
     let state_file = provided_state_file.unwrap_or_else(default_state_file);
+    if cleanup {
+        cleanup_state_file(&state_file, &inputs, checkpoint, dry_run);
+        return;
+    }
+
+    if inputs.is_empty() && !query.is_active() {
+        eprintln!("Either --input/-i, --dir, --find/-f, or --cleanup is required");
+        std::process::exit(2);
+    }
+
     let resume_cache = if resume_enabled && !inputs.is_empty() {
         Some(Arc::new(ResumeCache::load(state_file.clone(), checkpoint)))
     } else {
@@ -296,6 +318,66 @@ fn default_state_file() -> PathBuf {
         .filter(|home| !home.is_empty())
         .map(|home| PathBuf::from(home).join(".fadupes_state.json"))
         .unwrap_or_else(|| PathBuf::from("fadupes_state.json"))
+}
+
+fn cleanup_state_file(state_file: &Path, inputs: &[PathBuf], checkpoint: usize, dry_run: bool) {
+    if !state_file.exists() {
+        println!(
+            "State file not found: {}. Checked 0 state entries.",
+            state_file.display()
+        );
+        return;
+    }
+
+    let roots = cleanup_roots(inputs);
+    let cache = if dry_run {
+        ResumeCache::load_read_only(state_file.to_path_buf(), checkpoint)
+    } else {
+        ResumeCache::load(state_file.to_path_buf(), checkpoint)
+    };
+    let report = cache
+        .cleanup_missing(&roots, dry_run)
+        .unwrap_or_else(|err| {
+            eprintln!(
+                "Failed to cleanup state file {}: {err}",
+                state_file.display()
+            );
+            std::process::exit(1);
+        });
+    let scope = if roots.is_empty() {
+        "all state entries".to_string()
+    } else {
+        format!("state entries under {} input root(s)", roots.len())
+    };
+
+    if dry_run {
+        println!(
+            "Dry run: would remove {} stale state entries from {} (checked {}). No files would be deleted.",
+            report.stale_entries, scope, report.checked_entries
+        );
+    } else {
+        println!(
+            "Removed {} stale state entries from {} (checked {}). No audio files were deleted.",
+            report.stale_entries, scope, report.checked_entries
+        );
+    }
+}
+
+fn cleanup_roots(inputs: &[PathBuf]) -> Vec<PathBuf> {
+    inputs
+        .iter()
+        .map(|input| {
+            std::fs::canonicalize(input).unwrap_or_else(|_| {
+                if input.is_absolute() {
+                    input.clone()
+                } else {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join(input)
+                }
+            })
+        })
+        .collect()
 }
 
 fn build_query(dir: Option<PathBuf>, pattern: Option<String>) -> Query {

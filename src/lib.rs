@@ -319,10 +319,24 @@ pub struct ResumeCache {
     pub save_every: usize,
     pub pending: Arc<AtomicUsize>,
     save_lock: Arc<Mutex<()>>,
+    save_on_drop: bool,
 }
 
 impl ResumeCache {
     pub fn load(path: PathBuf, save_every: usize) -> Self {
+        Self::load_with_options(path, save_every, true, true)
+    }
+
+    pub fn load_read_only(path: PathBuf, save_every: usize) -> Self {
+        Self::load_with_options(path, save_every, false, false)
+    }
+
+    fn load_with_options(
+        path: PathBuf,
+        save_every: usize,
+        save_on_drop: bool,
+        backup_on_error: bool,
+    ) -> Self {
         let data = match std::fs::File::open(&path) {
             Ok(file) => match serde_json::from_reader::<_, HashMap<String, CachedEntry>>(file) {
                 Ok(map) => map,
@@ -331,7 +345,9 @@ impl ResumeCache {
                         "Warning: failed to parse state file {}: {err}. Starting with empty state.",
                         path.display()
                     );
-                    backup_broken(&path, &format!("{err}"));
+                    if backup_on_error {
+                        backup_broken(&path, &format!("{err}"));
+                    }
                     HashMap::new()
                 }
             },
@@ -341,7 +357,9 @@ impl ResumeCache {
                     "Warning: failed to open state file {}: {err}. Starting with empty state.",
                     path.display()
                 );
-                backup_broken(&path, &format!("{err}"));
+                if backup_on_error {
+                    backup_broken(&path, &format!("{err}"));
+                }
                 HashMap::new()
             }
         };
@@ -352,6 +370,7 @@ impl ResumeCache {
             save_every,
             pending: Arc::new(AtomicUsize::new(0)),
             save_lock: Arc::new(Mutex::new(())),
+            save_on_drop,
         }
     }
 
@@ -417,12 +436,62 @@ impl ResumeCache {
         std::fs::rename(tmp_path, &self.path)?;
         Ok(())
     }
+
+    pub fn cleanup_missing(
+        &self,
+        roots: &[PathBuf],
+        dry_run: bool,
+    ) -> std::io::Result<CleanupReport> {
+        let (checked_entries, stale_keys) = {
+            let map = self.data.lock().unwrap();
+            let mut checked_entries = 0usize;
+            let mut stale_keys = Vec::new();
+
+            for file_path in map.keys() {
+                let path = Path::new(file_path);
+                if !roots.is_empty() && !roots.iter().any(|root| path.starts_with(root)) {
+                    continue;
+                }
+
+                checked_entries += 1;
+                if !path.is_file() {
+                    stale_keys.push(file_path.clone());
+                }
+            }
+
+            (checked_entries, stale_keys)
+        };
+
+        let stale_entries = stale_keys.len();
+        if !dry_run && stale_entries > 0 {
+            {
+                let mut map = self.data.lock().unwrap();
+                for key in stale_keys {
+                    map.remove(&key);
+                }
+            }
+            self.save()?;
+        }
+
+        Ok(CleanupReport {
+            checked_entries,
+            stale_entries,
+        })
+    }
 }
 
 impl Drop for ResumeCache {
     fn drop(&mut self) {
-        let _ = self.save();
+        if self.save_on_drop {
+            let _ = self.save();
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct CleanupReport {
+    pub checked_entries: usize,
+    pub stale_entries: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1039,5 +1108,112 @@ mod tests {
         assert_eq!(audio_file.bit_depth, 24);
         assert_eq!(audio_file.file_size, 333);
         assert_eq!(audio_file.modified_secs, 444);
+    }
+
+    #[test]
+    fn cleanup_missing_dry_run_and_scope() {
+        let temp_dir = test_temp_dir("cleanup");
+        let root = temp_dir.join("root");
+        let outside = temp_dir.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let existing_path = root.join("existing.flac");
+        let missing_path = root.join("missing.flac");
+        let outside_missing_path = outside.join("missing.flac");
+        std::fs::write(&existing_path, []).unwrap();
+
+        let state_path = temp_dir.join("state.json");
+        let cache = ResumeCache {
+            path: state_path.clone(),
+            data: Arc::new(Mutex::new(HashMap::from([
+                (
+                    existing_path.to_string_lossy().to_string(),
+                    cached_entry_for(&existing_path),
+                ),
+                (
+                    missing_path.to_string_lossy().to_string(),
+                    cached_entry_for(&missing_path),
+                ),
+                (
+                    outside_missing_path.to_string_lossy().to_string(),
+                    cached_entry_for(&outside_missing_path),
+                ),
+            ]))),
+            save_every: 250,
+            pending: Arc::new(AtomicUsize::new(0)),
+            save_lock: Arc::new(Mutex::new(())),
+            save_on_drop: false,
+        };
+
+        let dry_run = cache
+            .cleanup_missing(std::slice::from_ref(&root), true)
+            .unwrap();
+        assert_eq!(
+            dry_run,
+            CleanupReport {
+                checked_entries: 2,
+                stale_entries: 1,
+            }
+        );
+        assert_eq!(cache.data.lock().unwrap().len(), 3);
+
+        let cleanup = cache
+            .cleanup_missing(std::slice::from_ref(&root), false)
+            .unwrap();
+        assert_eq!(
+            cleanup,
+            CleanupReport {
+                checked_entries: 2,
+                stale_entries: 1,
+            }
+        );
+
+        let map = cache.data.lock().unwrap();
+        assert!(map.contains_key(&existing_path.to_string_lossy().to_string()));
+        assert!(!map.contains_key(&missing_path.to_string_lossy().to_string()));
+        assert!(map.contains_key(&outside_missing_path.to_string_lossy().to_string()));
+        drop(map);
+
+        let saved: HashMap<String, CachedEntry> =
+            serde_json::from_reader(File::open(&state_path).unwrap()).unwrap();
+        assert!(!saved.contains_key(&missing_path.to_string_lossy().to_string()));
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_load_does_not_backup_or_rewrite_broken_state() {
+        let temp_dir = test_temp_dir("readonly");
+        let state_path = temp_dir.join("state.json");
+        let broken_path = state_path.with_extension("json.broken");
+        std::fs::write(&state_path, "{not-json").unwrap();
+
+        {
+            let cache = ResumeCache::load_read_only(state_path.clone(), 250);
+            assert_eq!(cache.data.lock().unwrap().len(), 0);
+        }
+
+        assert!(state_path.exists());
+        assert!(!broken_path.exists());
+        assert_eq!(std::fs::read_to_string(&state_path).unwrap(), "{not-json");
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    fn cached_entry_for(path: &Path) -> CachedEntry {
+        let mut audio_file = sample_audio_file();
+        audio_file.file_path = path.to_string_lossy().to_string();
+        CachedEntry::from_audio_file(&audio_file, audio_file.file_size, audio_file.modified_secs)
+    }
+
+    fn test_temp_dir(name: &str) -> PathBuf {
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("fadupes-{name}-{}-{now}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

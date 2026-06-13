@@ -58,6 +58,8 @@ fadupes -i <directory1> <directory2>
 fadupes -i <file1> <file2>
 fadupes --dir <directory>
 fadupes -f <pattern>
+fadupes --cleanup
+fadupes --cleanup --dry-run
 ```
 
 Inputs may be directories, files, or any combination of both.
@@ -124,6 +126,17 @@ Without `-i`, query options read the global resume state.
 
   * Disable loading and saving of the resume state
 
+* `--cleanup`
+
+  * Remove stale state entries whose files no longer exist, then exit
+  * With `-i`, cleanup is limited to entries under those input roots
+  * Without `-i`, cleanup checks the whole state file
+  * This only edits the state file; it does not delete audio files
+
+* `--dry-run`
+
+  * Show how many state entries `--cleanup` would remove without writing the state file
+
 * `--format <FORMAT>`
 
   * Set duplicate result output format
@@ -140,6 +153,8 @@ Without `-i`, query options read the global resume state.
 * On Ctrl+C, the state is saved before exiting
 * Query mode (`--dir` / `--find`) reads the state file without scanning
 * State entries are keyed by file path; values contain the decoded audio metrics plus size/mtime validation metadata
+* `--cleanup --dry-run` reports stale entries without changing the state file
+* `--cleanup` removes stale state entries for files that no longer exist
 
 ---
 
