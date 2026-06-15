@@ -132,6 +132,7 @@ Without `-i`, query options read the global resume state.
   * Remove stale state entries whose files no longer exist, then exit
   * With `-i`, cleanup is limited to entries under those input roots
   * Without `-i`, cleanup checks the whole state database
+  * Compacts the state database after cleanup to reclaim disk space
   * This only edits the state database; it does not delete audio files
 
 * `--dry-run`
@@ -157,7 +158,7 @@ Without `-i`, query options read the global resume state.
 * Query mode (`--dir` / `--find`) reads the state database without scanning
 * State entries are keyed by file path; values contain the decoded audio metrics plus size/mtime validation metadata
 * `--cleanup --dry-run` lists stale entries without changing the state database
-* `--cleanup` lists and removes stale state entries for files that no longer exist
+* `--cleanup` lists and removes stale state entries for files that no longer exist, then compacts the state database
 
 ---
 

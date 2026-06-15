@@ -1,5 +1,5 @@
 use heed::types::{SerdeJson, Str};
-use heed::{Database, Env, EnvFlags, EnvOpenOptions, WithoutTls};
+use heed::{CompactionOption, Database, Env, EnvFlags, EnvOpenOptions, WithoutTls};
 use hound::WavReader;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -720,6 +720,49 @@ impl ResumeCache {
             stale_paths: stale_keys,
         })
     }
+
+    pub fn compact(self) -> StateResult<Option<CompactReport>> {
+        self.save()?;
+
+        let Some(env) = self.env.as_ref() else {
+            return Ok(None);
+        };
+        if self.db.is_none() {
+            return Ok(None);
+        }
+
+        let data_path = self.path.join("data.mdb");
+        if !data_path.is_file() {
+            return Ok(None);
+        }
+
+        let tmp_path = self.path.join("data.mdb.compact");
+        let backup_path = self.path.join("data.mdb.precompact");
+        let before_bytes = std::fs::metadata(&data_path)?.len();
+        let compacted = env.copy_to_path(&tmp_path, CompactionOption::Enabled)?;
+        compacted.sync_all()?;
+        drop(compacted);
+        let after_bytes = std::fs::metadata(&tmp_path)?.len();
+
+        let db_path = self.path.clone();
+        drop(self);
+
+        if backup_path.exists() {
+            std::fs::remove_file(&backup_path)?;
+        }
+        std::fs::rename(&data_path, &backup_path)?;
+        if let Err(err) = std::fs::rename(&tmp_path, &data_path) {
+            let _ = std::fs::rename(&backup_path, &data_path);
+            return Err(Box::new(err));
+        }
+        std::fs::remove_file(&backup_path)?;
+
+        Ok(Some(CompactReport {
+            db_path,
+            before_bytes,
+            after_bytes,
+        }))
+    }
 }
 
 impl Drop for ResumeCache {
@@ -735,6 +778,13 @@ pub struct CleanupReport {
     pub checked_entries: usize,
     pub stale_entries: usize,
     pub stale_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CompactReport {
+    pub db_path: PathBuf,
+    pub before_bytes: u64,
+    pub after_bytes: u64,
 }
 
 fn cleanup_path_is_checked(file_path: &str, roots: &[PathBuf]) -> bool {
@@ -1552,6 +1602,31 @@ mod tests {
                 stale_paths: Vec::new(),
             }
         );
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn compact_rewrites_database_and_preserves_entries() {
+        let temp_dir = test_temp_dir("compact");
+        let state_path = temp_dir.join("state.mdb");
+        let audio_path = temp_dir.join("track.flac");
+        std::fs::write(&audio_path, []).unwrap();
+
+        {
+            let cache = ResumeCache::load(state_path.clone(), 250);
+            store_test_entry(&cache, &audio_path);
+            cache.save().unwrap();
+            let report = cache.compact().unwrap().unwrap();
+            assert_eq!(report.db_path, state_path);
+            assert!(report.before_bytes > 0);
+            assert!(report.after_bytes > 0);
+        }
+
+        let cache = ResumeCache::load_read_only(state_path, 250);
+        let files = cache.all_audio_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_path, audio_path.to_string_lossy().as_ref());
 
         std::fs::remove_dir_all(temp_dir).unwrap();
     }

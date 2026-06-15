@@ -364,10 +364,41 @@ fn cleanup_state_file(state_file: &Path, inputs: &[PathBuf], checkpoint: usize, 
         for file_path in &report.stale_paths {
             println!("Removed stale state entry: {file_path}");
         }
+        let compact_report = cache.compact().unwrap_or_else(|err| {
+            eprintln!(
+                "Failed to compact state database {}: {err}",
+                state_file.display()
+            );
+            std::process::exit(1);
+        });
         println!(
             "Removed {} stale state entries from {} (checked {}). No audio files were deleted.",
             report.stale_entries, scope, report.checked_entries
         );
+        if let Some(report) = compact_report {
+            println!(
+                "Compacted state database {}: {} -> {}.",
+                report.db_path.display(),
+                format_bytes(report.before_bytes),
+                format_bytes(report.after_bytes)
+            );
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
