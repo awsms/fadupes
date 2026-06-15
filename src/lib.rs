@@ -160,6 +160,7 @@ impl Default for AudioFile {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CachedEntry {
+    pub analysis_version: u32,
     pub total_samples: u64,
     pub sample_rate: u32,
     pub bit_depth: u32,
@@ -172,6 +173,8 @@ pub struct CachedEntry {
 
 #[derive(Debug, Deserialize)]
 struct CurrentCachedEntry {
+    #[serde(default)]
+    analysis_version: u32,
     total_samples: u64,
     sample_rate: u32,
     bit_depth: u32,
@@ -203,6 +206,7 @@ enum CachedEntryFormat {
 impl CachedEntry {
     pub fn from_audio_file(audio_file: &AudioFile, file_size: u64, modified_secs: u64) -> Self {
         Self {
+            analysis_version: CURRENT_ANALYSIS_VERSION,
             total_samples: audio_file.total_samples,
             sample_rate: audio_file.sample_rate,
             bit_depth: audio_file.bit_depth,
@@ -227,11 +231,18 @@ impl CachedEntry {
             modified_secs: self.modified_secs,
         }
     }
+
+    fn is_valid_for(&self, file_size: u64, modified_secs: u64) -> bool {
+        self.analysis_version == CURRENT_ANALYSIS_VERSION
+            && self.file_size == file_size
+            && self.modified_secs == modified_secs
+    }
 }
 
 impl From<CurrentCachedEntry> for CachedEntry {
     fn from(entry: CurrentCachedEntry) -> Self {
         Self {
+            analysis_version: entry.analysis_version,
             total_samples: entry.total_samples,
             sample_rate: entry.sample_rate,
             bit_depth: entry.bit_depth,
@@ -247,6 +258,7 @@ impl From<CurrentCachedEntry> for CachedEntry {
 impl From<LegacyCachedEntry> for CachedEntry {
     fn from(entry: LegacyCachedEntry) -> Self {
         Self {
+            analysis_version: 0,
             total_samples: entry.audio_file.total_samples,
             sample_rate: entry.audio_file.sample_rate,
             bit_depth: entry.audio_file.bit_depth,
@@ -321,6 +333,7 @@ const STATE_DB_NAME: &str = "audio";
 const STATE_DB_EXTENSION: &str = "mdb";
 const LEGACY_JSON_EXTENSION: &str = "json";
 const STATE_MAP_SIZE: usize = 1024 * 1024 * 1024;
+const CURRENT_ANALYSIS_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct StatePaths {
@@ -559,7 +572,7 @@ impl ResumeCache {
         let path_key = file_path.to_string_lossy().to_string();
         if let Some(audio_file) = self.data.lock().ok().and_then(|map| {
             map.get(&path_key).and_then(|entry| {
-                if entry.file_size == file_size && entry.modified_secs == modified_secs {
+                if entry.is_valid_for(file_size, modified_secs) {
                     Some(entry.to_audio_file(path_key.clone()))
                 } else {
                     None
@@ -573,7 +586,7 @@ impl ResumeCache {
         let db = self.db?;
         let rtxn = env.read_txn().ok()?;
         db.get(&rtxn, &path_key).ok().flatten().and_then(|entry| {
-            if entry.file_size == file_size && entry.modified_secs == modified_secs {
+            if entry.is_valid_for(file_size, modified_secs) {
                 Some(entry.to_audio_file(path_key))
             } else {
                 None
@@ -1311,6 +1324,7 @@ mod tests {
 
         assert!(value.get("audio_file").is_none());
         assert!(value.get("file_path").is_none());
+        assert_eq!(value["analysis_version"], json!(CURRENT_ANALYSIS_VERSION));
         assert_eq!(value["total_samples"], json!(12345));
         assert_eq!(value["file_size"], json!(98765));
         assert_eq!(value["modified_secs"], json!(1234567890));
@@ -1343,6 +1357,37 @@ mod tests {
         assert_eq!(audio_file.bit_depth, 24);
         assert_eq!(audio_file.file_size, 333);
         assert_eq!(audio_file.modified_secs, 444);
+        assert_eq!(entry.analysis_version, 0);
+    }
+
+    #[test]
+    fn lookup_rejects_stale_analysis_version() {
+        let temp_dir = test_temp_dir("stale-version");
+        let state_path = temp_dir.join("state.mdb");
+        let audio_path = temp_dir.join("track.flac");
+        std::fs::write(&audio_path, []).unwrap();
+
+        let mut stale_entry = cached_entry_for(&audio_path);
+        stale_entry.analysis_version = 0;
+
+        let cache = ResumeCache::load(state_path, 250);
+        cache
+            .data
+            .lock()
+            .unwrap()
+            .insert(audio_path.to_string_lossy().to_string(), stale_entry);
+
+        assert!(
+            cache
+                .lookup(
+                    &audio_path,
+                    sample_audio_file().file_size,
+                    sample_audio_file().modified_secs,
+                )
+                .is_none()
+        );
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
     #[test]
