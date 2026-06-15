@@ -14,7 +14,7 @@
   - Global progress bar
   - Optional per-file “currently scanning” output
 - **Resumable scans**
-  - Optional JSON state file
+  - Optional Heed/LMDB state database
   - Automatically loads existing state
   - Periodically saved during processing
   - Saved automatically on Ctrl+C
@@ -119,8 +119,9 @@ Without `-i`, query options read the global resume state.
 
 * `--state-file <PATH>`
 
-  * Path to the resume state file
-  * Default: `~/.fadupes_state.json`
+  * Path to the resume state database directory
+  * Default: `~/.fadupes_state.mdb`
+  * Legacy JSON paths like `~/.fadupes_state.json` are migrated to the matching `.mdb` database
 
 * `--no-resume`
 
@@ -130,12 +131,12 @@ Without `-i`, query options read the global resume state.
 
   * Remove stale state entries whose files no longer exist, then exit
   * With `-i`, cleanup is limited to entries under those input roots
-  * Without `-i`, cleanup checks the whole state file
-  * This only edits the state file; it does not delete audio files
+  * Without `-i`, cleanup checks the whole state database
+  * This only edits the state database; it does not delete audio files
 
 * `--dry-run`
 
-  * List the state entries `--cleanup` would remove and show the total without writing the state file
+  * List the state entries `--cleanup` would remove and show the total without writing the state database
 
 * `--format <FORMAT>`
 
@@ -147,13 +148,15 @@ Without `-i`, query options read the global resume state.
 
 ## Resume behavior
 
-* State files are written to `~/.fadupes_state.json` by default
-* If the state file exists, it is loaded automatically
+* State databases are written to `~/.fadupes_state.mdb` by default
+* Legacy JSON state files are migrated automatically into the matching `.mdb` database on normal load
+* Migrated JSON files are moved aside with a `.migrated` suffix
+* If the state database exists, it is loaded automatically
 * The state is saved periodically during the scan (tune with `--checkpoint`)
 * On Ctrl+C, the state is saved before exiting
-* Query mode (`--dir` / `--find`) reads the state file without scanning
+* Query mode (`--dir` / `--find`) reads the state database without scanning
 * State entries are keyed by file path; values contain the decoded audio metrics plus size/mtime validation metadata
-* `--cleanup --dry-run` lists stale entries without changing the state file
+* `--cleanup --dry-run` lists stale entries without changing the state database
 * `--cleanup` lists and removes stale state entries for files that no longer exist
 
 ---

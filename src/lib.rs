@@ -1,3 +1,5 @@
+use heed::types::{SerdeJson, Str};
+use heed::{Database, Env, EnvFlags, EnvOpenOptions, WithoutTls};
 use hound::WavReader;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -312,23 +314,62 @@ impl SeenFiles {
     }
 }
 
+type StateDb = Database<Str, SerdeJson<CachedEntry>>;
+pub type StateResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+const STATE_DB_NAME: &str = "audio";
+const STATE_DB_EXTENSION: &str = "mdb";
+const LEGACY_JSON_EXTENSION: &str = "json";
+const STATE_MAP_SIZE: usize = 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct StatePaths {
+    pub db_path: PathBuf,
+    pub legacy_json_path: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResumeCache {
     pub path: PathBuf,
     pub data: Arc<Mutex<HashMap<String, CachedEntry>>>,
     pub save_every: usize,
     pub pending: Arc<AtomicUsize>,
+    env: Option<Env<WithoutTls>>,
+    db: Option<StateDb>,
     save_lock: Arc<Mutex<()>>,
     save_on_drop: bool,
 }
 
 impl ResumeCache {
+    pub fn resolve_state_paths(path: PathBuf) -> StatePaths {
+        let is_json = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(LEGACY_JSON_EXTENSION));
+
+        let db_path = if is_json {
+            path.with_extension(STATE_DB_EXTENSION)
+        } else {
+            path.clone()
+        };
+        let legacy_json_path = if is_json {
+            path
+        } else {
+            db_path.with_extension(LEGACY_JSON_EXTENSION)
+        };
+
+        StatePaths {
+            db_path,
+            legacy_json_path,
+        }
+    }
+
     pub fn load(path: PathBuf, save_every: usize) -> Self {
-        Self::load_with_options(path, save_every, true, true)
+        Self::load_with_options(path, save_every, true, true, true)
     }
 
     pub fn load_read_only(path: PathBuf, save_every: usize) -> Self {
-        Self::load_with_options(path, save_every, false, false)
+        Self::load_with_options(path, save_every, false, false, false)
     }
 
     fn load_with_options(
@@ -336,42 +377,172 @@ impl ResumeCache {
         save_every: usize,
         save_on_drop: bool,
         backup_on_error: bool,
+        allow_writes: bool,
     ) -> Self {
-        let data = match std::fs::File::open(&path) {
-            Ok(file) => match serde_json::from_reader::<_, HashMap<String, CachedEntry>>(file) {
-                Ok(map) => map,
-                Err(err) => {
-                    eprintln!(
-                        "Warning: failed to parse state file {}: {err}. Starting with empty state.",
-                        path.display()
-                    );
-                    if backup_on_error {
-                        backup_broken(&path, &format!("{err}"));
+        let paths = Self::resolve_state_paths(path);
+        let mut data = HashMap::new();
+        let mut env = None;
+        let mut db = None;
+
+        match Self::open_db(&paths.db_path, allow_writes) {
+            Ok(Some((opened_env, opened_db))) => {
+                if allow_writes {
+                    if let Err(err) = Self::migrate_legacy_json(
+                        &opened_env,
+                        opened_db,
+                        &paths.legacy_json_path,
+                        backup_on_error,
+                    ) {
+                        eprintln!(
+                            "Warning: failed to migrate legacy state file {}: {err}",
+                            paths.legacy_json_path.display()
+                        );
                     }
-                    HashMap::new()
                 }
-            },
-            Err(err) if err.kind() == ErrorKind::NotFound => HashMap::new(),
+                env = Some(opened_env);
+                db = Some(opened_db);
+            }
+            Ok(None) => {
+                if !allow_writes {
+                    data = Self::load_legacy_json(&paths.legacy_json_path, backup_on_error)
+                        .unwrap_or_default();
+                }
+            }
             Err(err) => {
                 eprintln!(
-                    "Warning: failed to open state file {}: {err}. Starting with empty state.",
-                    path.display()
+                    "Warning: failed to open state database {}: {err}. Starting with empty state.",
+                    paths.db_path.display()
                 );
-                if backup_on_error {
-                    backup_broken(&path, &format!("{err}"));
-                }
-                HashMap::new()
             }
-        };
+        }
 
         ResumeCache {
-            path,
+            path: paths.db_path,
             data: Arc::new(Mutex::new(data)),
             save_every,
             pending: Arc::new(AtomicUsize::new(0)),
+            env,
+            db,
             save_lock: Arc::new(Mutex::new(())),
             save_on_drop,
         }
+    }
+
+    fn open_db(path: &Path, allow_writes: bool) -> StateResult<Option<(Env<WithoutTls>, StateDb)>> {
+        if allow_writes {
+            std::fs::create_dir_all(path)?;
+        } else if !path.is_dir() {
+            return Ok(None);
+        }
+
+        let mut options = EnvOpenOptions::new().read_txn_without_tls();
+        options.map_size(STATE_MAP_SIZE).max_dbs(2);
+        if !allow_writes {
+            // Dry-run/query reads should not need write access to the LMDB environment.
+            unsafe {
+                options.flags(EnvFlags::READ_ONLY);
+            }
+        }
+        // Heed wraps LMDB's memory map. The path is owned by fadupes and all access goes through Heed.
+        let env = unsafe { options.open(path)? };
+
+        let db = if allow_writes {
+            let mut wtxn = env.write_txn()?;
+            let db = env.create_database(&mut wtxn, Some(STATE_DB_NAME))?;
+            wtxn.commit()?;
+            db
+        } else {
+            let rtxn = env.read_txn()?;
+            let Some(db) = env.open_database(&rtxn, Some(STATE_DB_NAME))? else {
+                return Ok(None);
+            };
+            rtxn.commit()?;
+            db
+        };
+
+        Ok(Some((env, db)))
+    }
+
+    fn load_legacy_json(
+        path: &Path,
+        backup_on_error: bool,
+    ) -> Option<HashMap<String, CachedEntry>> {
+        match std::fs::File::open(path) {
+            Ok(file) => match serde_json::from_reader::<_, HashMap<String, CachedEntry>>(file) {
+                Ok(map) => Some(map),
+                Err(err) => {
+                    eprintln!(
+                        "Warning: failed to parse legacy state file {}: {err}. Starting with empty state.",
+                        path.display()
+                    );
+                    if backup_on_error {
+                        backup_broken(path, &format!("{err}"));
+                    }
+                    None
+                }
+            },
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => {
+                eprintln!(
+                    "Warning: failed to open legacy state file {}: {err}. Starting with empty state.",
+                    path.display()
+                );
+                if backup_on_error {
+                    backup_broken(path, &format!("{err}"));
+                }
+                None
+            }
+        }
+    }
+
+    fn migrate_legacy_json(
+        env: &Env<WithoutTls>,
+        db: StateDb,
+        legacy_path: &Path,
+        backup_on_error: bool,
+    ) -> StateResult<()> {
+        if !legacy_path.exists() {
+            return Ok(());
+        }
+
+        let rtxn = env.read_txn()?;
+        let db_is_empty = db.is_empty(&rtxn)?;
+        drop(rtxn);
+        if !db_is_empty {
+            return Ok(());
+        }
+
+        let Some(entries) = Self::load_legacy_json(legacy_path, backup_on_error) else {
+            return Ok(());
+        };
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let mut wtxn = env.write_txn()?;
+        for (file_path, entry) in &entries {
+            db.put(&mut wtxn, file_path, entry)?;
+        }
+        wtxn.commit()?;
+
+        let migrated_path = legacy_path.with_extension("json.migrated");
+        match std::fs::rename(legacy_path, &migrated_path) {
+            Ok(_) => eprintln!(
+                "Migrated legacy state file {} to {} entries in {}. Old JSON moved to {}.",
+                legacy_path.display(),
+                entries.len(),
+                env.path().display(),
+                migrated_path.display()
+            ),
+            Err(err) => eprintln!(
+                "Warning: migrated legacy state file {} but failed to move it to {}: {}",
+                legacy_path.display(),
+                migrated_path.display(),
+                err
+            ),
+        }
+
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -386,8 +557,22 @@ impl ResumeCache {
         modified_secs: u64,
     ) -> Option<AudioFile> {
         let path_key = file_path.to_string_lossy().to_string();
-        let map = self.data.lock().ok()?;
-        map.get(&path_key).and_then(|entry| {
+        if let Some(audio_file) = self.data.lock().ok().and_then(|map| {
+            map.get(&path_key).and_then(|entry| {
+                if entry.file_size == file_size && entry.modified_secs == modified_secs {
+                    Some(entry.to_audio_file(path_key.clone()))
+                } else {
+                    None
+                }
+            })
+        }) {
+            return Some(audio_file);
+        }
+
+        let env = self.env.as_ref()?;
+        let db = self.db?;
+        let rtxn = env.read_txn().ok()?;
+        db.get(&rtxn, &path_key).ok().flatten().and_then(|entry| {
             if entry.file_size == file_size && entry.modified_secs == modified_secs {
                 Some(entry.to_audio_file(path_key))
             } else {
@@ -413,66 +598,107 @@ impl ResumeCache {
         }
     }
 
-    pub fn save(&self) -> std::io::Result<()> {
-        // Serialize writers to the temp file/rename to avoid corruption from concurrent saves
+    pub fn save(&self) -> StateResult<()> {
         let _lock = self.save_lock.lock().unwrap();
+        let Some(env) = self.env.as_ref() else {
+            return Ok(());
+        };
+        let Some(db) = self.db else {
+            return Ok(());
+        };
 
-        let snapshot = {
+        let pending_entries = {
             let map = self.data.lock().unwrap();
+            if map.is_empty() {
+                self.pending.store(0, Ordering::Relaxed);
+                return Ok(());
+            }
             map.clone()
         };
 
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        let mut wtxn = env.write_txn()?;
+        for (file_path, entry) in &pending_entries {
+            db.put(&mut wtxn, file_path, entry)?;
         }
+        wtxn.commit()?;
 
-        // Atomic-ish save: write to a temp file then rename, so we don't leave a half-written JSON behind
-        let tmp_path = self.path.with_extension("tmp");
-        let file = File::create(&tmp_path)?;
-        serde_json::to_writer(&file, &snapshot)?;
-        file.sync_all()?; // ensure bytes hit disk before rename
-        std::fs::rename(tmp_path, &self.path)?;
+        let mut map = self.data.lock().unwrap();
+        for file_path in pending_entries.keys() {
+            map.remove(file_path);
+        }
+        self.pending.store(0, Ordering::Relaxed);
         Ok(())
     }
 
-    pub fn cleanup_missing(
-        &self,
-        roots: &[PathBuf],
-        dry_run: bool,
-    ) -> std::io::Result<CleanupReport> {
-        let (checked_entries, mut stale_keys) = {
-            let map = self.data.lock().unwrap();
-            let mut checked_entries = 0usize;
-            let mut stale_keys = Vec::new();
+    pub fn all_audio_files(&self) -> StateResult<Vec<AudioFile>> {
+        let mut files = Vec::new();
+        let mut seen_paths = HashSet::new();
 
-            for file_path in map.keys() {
-                let path = Path::new(file_path);
-                if !roots.is_empty() && !roots.iter().any(|root| path.starts_with(root)) {
-                    continue;
-                }
+        if let (Some(env), Some(db)) = (self.env.as_ref(), self.db) {
+            let rtxn = env.read_txn()?;
+            for result in db.iter(&rtxn)? {
+                let (file_path, entry) = result?;
+                seen_paths.insert(file_path.to_string());
+                files.push(entry.to_audio_file(file_path.to_string()));
+            }
+        }
 
-                checked_entries += 1;
-                if !path.is_file() {
-                    stale_keys.push(file_path.clone());
+        let map = self.data.lock().unwrap();
+        for (file_path, entry) in map.iter() {
+            if seen_paths.insert(file_path.clone()) {
+                files.push(entry.to_audio_file(file_path.clone()));
+            }
+        }
+
+        Ok(files)
+    }
+
+    pub fn cleanup_missing(&self, roots: &[PathBuf], dry_run: bool) -> StateResult<CleanupReport> {
+        let mut checked_entries = 0usize;
+        let mut stale_keys = Vec::new();
+
+        if let (Some(env), Some(db)) = (self.env.as_ref(), self.db) {
+            let rtxn = env.read_txn()?;
+            for result in db.iter(&rtxn)? {
+                let (file_path, _) = result?;
+                if cleanup_path_is_checked(file_path, roots) {
+                    checked_entries += 1;
+                    if !Path::new(file_path).is_file() {
+                        stale_keys.push(file_path.to_string());
+                    }
                 }
             }
+        }
 
-            (checked_entries, stale_keys)
-        };
+        {
+            let map = self.data.lock().unwrap();
+            for file_path in map.keys() {
+                if cleanup_path_is_checked(file_path, roots) {
+                    checked_entries += 1;
+                    if !Path::new(file_path).is_file() {
+                        stale_keys.push(file_path.clone());
+                    }
+                }
+            }
+        }
 
         stale_keys.sort_unstable();
+        stale_keys.dedup();
 
         let stale_entries = stale_keys.len();
         if !dry_run && stale_entries > 0 {
-            {
-                let mut map = self.data.lock().unwrap();
+            if let (Some(env), Some(db)) = (self.env.as_ref(), self.db) {
+                let mut wtxn = env.write_txn()?;
                 for key in &stale_keys {
-                    map.remove(key);
+                    db.delete(&mut wtxn, key)?;
                 }
+                wtxn.commit()?;
             }
-            self.save()?;
+
+            let mut map = self.data.lock().unwrap();
+            for key in &stale_keys {
+                map.remove(key);
+            }
         }
 
         Ok(CleanupReport {
@@ -496,6 +722,11 @@ pub struct CleanupReport {
     pub checked_entries: usize,
     pub stale_entries: usize,
     pub stale_paths: Vec<String>,
+}
+
+fn cleanup_path_is_checked(file_path: &str, roots: &[PathBuf]) -> bool {
+    let path = Path::new(file_path);
+    roots.is_empty() || roots.iter().any(|root| path.starts_with(root))
 }
 
 #[derive(Debug, Clone)]
@@ -1127,28 +1358,12 @@ mod tests {
         let outside_missing_path = outside.join("missing.flac");
         std::fs::write(&existing_path, []).unwrap();
 
-        let state_path = temp_dir.join("state.json");
-        let cache = ResumeCache {
-            path: state_path.clone(),
-            data: Arc::new(Mutex::new(HashMap::from([
-                (
-                    existing_path.to_string_lossy().to_string(),
-                    cached_entry_for(&existing_path),
-                ),
-                (
-                    missing_path.to_string_lossy().to_string(),
-                    cached_entry_for(&missing_path),
-                ),
-                (
-                    outside_missing_path.to_string_lossy().to_string(),
-                    cached_entry_for(&outside_missing_path),
-                ),
-            ]))),
-            save_every: 250,
-            pending: Arc::new(AtomicUsize::new(0)),
-            save_lock: Arc::new(Mutex::new(())),
-            save_on_drop: false,
-        };
+        let state_path = temp_dir.join("state.mdb");
+        let cache = ResumeCache::load(state_path.clone(), 250);
+        store_test_entry(&cache, &existing_path);
+        store_test_entry(&cache, &missing_path);
+        store_test_entry(&cache, &outside_missing_path);
+        cache.save().unwrap();
 
         let dry_run = cache
             .cleanup_missing(std::slice::from_ref(&root), true)
@@ -1161,7 +1376,7 @@ mod tests {
                 stale_paths: vec![missing_path.to_string_lossy().to_string()],
             }
         );
-        assert_eq!(cache.data.lock().unwrap().len(), 3);
+        assert_eq!(cache.all_audio_files().unwrap().len(), 3);
 
         let cleanup = cache
             .cleanup_missing(std::slice::from_ref(&root), false)
@@ -1175,15 +1390,22 @@ mod tests {
             }
         );
 
-        let map = cache.data.lock().unwrap();
-        assert!(map.contains_key(&existing_path.to_string_lossy().to_string()));
-        assert!(!map.contains_key(&missing_path.to_string_lossy().to_string()));
-        assert!(map.contains_key(&outside_missing_path.to_string_lossy().to_string()));
-        drop(map);
-
-        let saved: HashMap<String, CachedEntry> =
-            serde_json::from_reader(File::open(&state_path).unwrap()).unwrap();
-        assert!(!saved.contains_key(&missing_path.to_string_lossy().to_string()));
+        let saved = cache.all_audio_files().unwrap();
+        assert!(
+            saved
+                .iter()
+                .any(|file| file.file_path == existing_path.to_string_lossy().as_ref())
+        );
+        assert!(
+            !saved
+                .iter()
+                .any(|file| file.file_path == missing_path.to_string_lossy().as_ref())
+        );
+        assert!(
+            saved
+                .iter()
+                .any(|file| file.file_path == outside_missing_path.to_string_lossy().as_ref())
+        );
 
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
@@ -1205,6 +1427,98 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&state_path).unwrap(), "{not-json");
 
         std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn load_migrates_legacy_json_to_heed_database() {
+        let temp_dir = test_temp_dir("migration");
+        let legacy_path = temp_dir.join("state.json");
+        let db_path = temp_dir.join("state.mdb");
+        let audio_path = temp_dir.join("track.flac");
+        let migrated_path = legacy_path.with_extension("json.migrated");
+
+        let entries = HashMap::from([(
+            audio_path.to_string_lossy().to_string(),
+            cached_entry_for(&audio_path),
+        )]);
+        serde_json::to_writer(File::create(&legacy_path).unwrap(), &entries).unwrap();
+
+        {
+            let cache = ResumeCache::load(legacy_path.clone(), 250);
+            assert_eq!(cache.path(), db_path.as_path());
+
+            let files = cache.all_audio_files().unwrap();
+            assert_eq!(files.len(), 1);
+            assert_eq!(files[0].file_path, audio_path.to_string_lossy().as_ref());
+        }
+
+        assert!(db_path.is_dir());
+        assert!(!legacy_path.exists());
+        assert!(migrated_path.exists());
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn heed_state_accepts_long_path_keys() {
+        let temp_dir = test_temp_dir("long-key");
+        let state_path = temp_dir.join("state.mdb");
+        let long_relative_path = std::iter::repeat_n("nested", 120)
+            .collect::<Vec<_>>()
+            .join("/");
+        let audio_path = temp_dir.join(long_relative_path).join("track.flac");
+        assert!(audio_path.to_string_lossy().len() > 511);
+
+        let cache = ResumeCache::load(state_path, 250);
+        store_test_entry(&cache, &audio_path);
+        cache.save().unwrap();
+
+        let files = cache.all_audio_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_path, audio_path.to_string_lossy().as_ref());
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn read_only_heed_state_can_iter_entries() {
+        let temp_dir = test_temp_dir("readonly-heed");
+        let state_path = temp_dir.join("state.mdb");
+        let audio_path = temp_dir.join("track.flac");
+        std::fs::write(&audio_path, []).unwrap();
+
+        {
+            let cache = ResumeCache::load(state_path.clone(), 250);
+            store_test_entry(&cache, &audio_path);
+            cache.save().unwrap();
+        }
+
+        let cache = ResumeCache::load_read_only(state_path, 250);
+        let files = cache.all_audio_files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_path, audio_path.to_string_lossy().as_ref());
+
+        let report = cache.cleanup_missing(&[], true).unwrap();
+        assert_eq!(
+            report,
+            CleanupReport {
+                checked_entries: 1,
+                stale_entries: 0,
+                stale_paths: Vec::new(),
+            }
+        );
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    fn store_test_entry(cache: &ResumeCache, path: &Path) {
+        let mut audio_file = sample_audio_file();
+        audio_file.file_path = path.to_string_lossy().to_string();
+        cache.store(
+            audio_file.clone(),
+            audio_file.file_size,
+            audio_file.modified_secs,
+        );
     }
 
     fn cached_entry_for(path: &Path) -> CachedEntry {

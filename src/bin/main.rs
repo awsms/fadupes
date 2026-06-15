@@ -1,6 +1,6 @@
 use clap::{Arg, ArgAction, Command, ValueHint, crate_version, value_parser};
 use ctrlc;
-use fadupes::{AudioFile, CachedEntry, ResumeCache, SeenFiles, SizeFilter, parse_size_filter};
+use fadupes::{AudioFile, ResumeCache, SeenFiles, SizeFilter, parse_size_filter};
 use rayon::prelude::*;
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
@@ -146,7 +146,7 @@ fn main() {
             Arg::new("state_file")
                 .long("state-file")
                 .value_hint(ValueHint::FilePath)
-                .help("Path to the resume state file (default: ~/.fadupes_state.json)")
+                .help("Path to the resume state database (default: ~/.fadupes_state.mdb)")
                 .value_parser(value_parser!(PathBuf)),
         )
         .arg(
@@ -159,7 +159,7 @@ fn main() {
             Arg::new("no_resume")
                 .long("no-resume")
                 .action(ArgAction::SetTrue)
-                .help("Disable resuming from / saving to the state file"),
+                .help("Disable resuming from / saving to the state database"),
         )
         .arg(
             Arg::new("cleanup")
@@ -173,7 +173,7 @@ fn main() {
                 .long("dry-run")
                 .action(ArgAction::SetTrue)
                 .requires("cleanup")
-                .help("Show how many state entries --cleanup would remove without writing the state file"),
+                .help("Show how many state entries --cleanup would remove without writing the state database"),
         )
         .arg(
             Arg::new("ignore_size")
@@ -298,7 +298,7 @@ fn main() {
 
     let write_log = !inputs.is_empty() && !query.is_active();
     let audio_files = if inputs.is_empty() {
-        load_audio_files_from_state(&state_file)
+        load_audio_files_from_state(&state_file, checkpoint)
     } else {
         scan_audio_files(
             inputs,
@@ -316,15 +316,17 @@ fn main() {
 fn default_state_file() -> PathBuf {
     std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
-        .map(|home| PathBuf::from(home).join(".fadupes_state.json"))
-        .unwrap_or_else(|| PathBuf::from("fadupes_state.json"))
+        .map(|home| PathBuf::from(home).join(".fadupes_state.mdb"))
+        .unwrap_or_else(|| PathBuf::from("fadupes_state.mdb"))
 }
 
 fn cleanup_state_file(state_file: &Path, inputs: &[PathBuf], checkpoint: usize, dry_run: bool) {
-    if !state_file.exists() {
+    if !state_exists(state_file) {
+        let paths = ResumeCache::resolve_state_paths(state_file.to_path_buf());
         println!(
-            "State file not found: {}. Checked 0 state entries.",
-            state_file.display()
+            "State database not found: {} (legacy JSON: {}). Checked 0 state entries.",
+            paths.db_path.display(),
+            paths.legacy_json_path.display()
         );
         return;
     }
@@ -339,7 +341,7 @@ fn cleanup_state_file(state_file: &Path, inputs: &[PathBuf], checkpoint: usize, 
         .cleanup_missing(&roots, dry_run)
         .unwrap_or_else(|err| {
             eprintln!(
-                "Failed to cleanup state file {}: {err}",
+                "Failed to cleanup state database {}: {err}",
                 state_file.display()
             );
             std::process::exit(1);
@@ -367,6 +369,11 @@ fn cleanup_state_file(state_file: &Path, inputs: &[PathBuf], checkpoint: usize, 
             report.stale_entries, scope, report.checked_entries
         );
     }
+}
+
+fn state_exists(path: &Path) -> bool {
+    let paths = ResumeCache::resolve_state_paths(path.to_path_buf());
+    paths.db_path.is_dir() || paths.legacy_json_path.is_file()
 }
 
 fn cleanup_roots(inputs: &[PathBuf]) -> Vec<PathBuf> {
@@ -401,21 +408,25 @@ fn build_query(dir: Option<PathBuf>, pattern: Option<String>) -> Query {
     Query { dir, pattern }
 }
 
-fn load_audio_files_from_state(path: &Path) -> Vec<AudioFile> {
-    let file = std::fs::File::open(path).unwrap_or_else(|err| {
-        eprintln!("Failed to open state file {}: {err}", path.display());
+fn load_audio_files_from_state(path: &Path, checkpoint: usize) -> Vec<AudioFile> {
+    if !state_exists(path) {
+        let paths = ResumeCache::resolve_state_paths(path.to_path_buf());
+        eprintln!(
+            "Failed to open state database {} or legacy JSON {}",
+            paths.db_path.display(),
+            paths.legacy_json_path.display()
+        );
         std::process::exit(1);
-    });
-    let entries: HashMap<String, CachedEntry> =
-        serde_json::from_reader(file).unwrap_or_else(|err| {
-            eprintln!("Failed to parse state file {}: {err}", path.display());
-            std::process::exit(1);
-        });
+    }
 
-    entries
-        .into_iter()
-        .map(|(file_path, entry)| entry.to_audio_file(file_path))
-        .collect()
+    let cache = ResumeCache::load(path.to_path_buf(), checkpoint);
+    cache.all_audio_files().unwrap_or_else(|err| {
+        eprintln!(
+            "Failed to read state database {}: {err}",
+            cache.path().display()
+        );
+        std::process::exit(1);
+    })
 }
 
 fn scan_audio_files(
