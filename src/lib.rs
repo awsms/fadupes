@@ -1014,12 +1014,6 @@ impl AudioFile {
                     }
 
                     if let Some(audio_file) = cached {
-                        if let Some(ref mp) = list_mp {
-                            let _ = mp.println(format!(
-                                "Using cached result for: {}",
-                                candidate.path.display()
-                            ));
-                        }
                         if !already_processed {
                             progress.inc(1);
                         }
