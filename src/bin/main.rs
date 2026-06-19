@@ -131,6 +131,12 @@ fn main() {
                 .help("Query duplicate groups with at least one file path matching this case-insensitive regex"),
         )
         .arg(
+            Arg::new("du")
+                .long("du")
+                .action(ArgAction::SetTrue)
+                .help("Print summed duplicate file sizes in text output"),
+        )
+        .arg(
             Arg::new("skip_unique_size")
                 .long("skip-unique-size")
                 .action(ArgAction::SetTrue)
@@ -240,6 +246,7 @@ fn main() {
     );
     let cleanup = matches.get_flag("cleanup");
     let dry_run = matches.get_flag("dry_run");
+    let show_disk_usage = matches.get_flag("du");
 
     let list_files = !matches.get_flag("nolist") && !matches!(output_format, OutputFormat::Json);
     let skip_unique_size = matches.get_flag("skip_unique_size");
@@ -310,7 +317,13 @@ fn main() {
         )
     };
 
-    compare_audio_files(&audio_files, output_format, &query, write_log);
+    compare_audio_files(
+        &audio_files,
+        output_format,
+        &query,
+        write_log,
+        show_disk_usage,
+    );
 }
 
 fn default_state_file() -> PathBuf {
@@ -507,11 +520,14 @@ fn compare_audio_files(
     output_format: OutputFormat,
     query: &Query,
     write_log: bool,
+    show_disk_usage: bool,
 ) {
     let groups = filter_duplicate_groups(collect_duplicate_groups(audio_files), query);
 
     match output_format {
-        OutputFormat::Text => write_text_output(audio_files.len(), &groups, write_log),
+        OutputFormat::Text => {
+            write_text_output(audio_files.len(), &groups, write_log, show_disk_usage)
+        }
         OutputFormat::Json => write_json_output(audio_files.len(), groups),
     }
 }
@@ -562,6 +578,7 @@ fn write_text_output(
     scanned_files: usize,
     duplicate_groups: &[DuplicateGroup<'_>],
     write_log: bool,
+    show_disk_usage: bool,
 ) {
     // Output the results and write to the log file
     if duplicate_groups.is_empty() {
@@ -606,8 +623,46 @@ fn write_text_output(
                     writeln!(log_file, "{}", file.file_path).expect("Failed to write to log file");
                 }
             }
+            if show_disk_usage {
+                println!("=> {}", format_du_bytes(duplicate_group_size(group)));
+            }
             println!(); // Add an empty line between dupe groups
         }
+
+        if show_disk_usage {
+            println!(
+                "Total size: {}",
+                format_du_bytes(total_duplicate_size(duplicate_groups))
+            );
+        }
+    }
+}
+
+fn duplicate_group_size(group: &DuplicateGroup<'_>) -> u64 {
+    group.files.iter().map(|file| file.file_size).sum()
+}
+
+fn total_duplicate_size(groups: &[DuplicateGroup<'_>]) -> u64 {
+    groups.iter().map(duplicate_group_size).sum()
+}
+
+fn format_du_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1000.0 && unit + 1 < UNITS.len() {
+        value /= 1000.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes}{}", UNITS[unit])
+    } else if value >= 100.0 {
+        format!("{value:.0}{}", UNITS[unit])
+    } else if value >= 10.0 {
+        format!("{value:.1}{}", UNITS[unit])
+    } else {
+        format!("{value:.2}{}", UNITS[unit])
     }
 }
 
@@ -631,4 +686,50 @@ fn write_json_output(scanned_files: usize, groups: Vec<DuplicateGroup<'_>>) {
     let mut stdout = stdout.lock();
     serde_json::to_writer_pretty(&mut stdout, &report).expect("Failed to write JSON output");
     writeln!(stdout).expect("Failed to write JSON output");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn audio_file(path: &str, file_size: u64) -> AudioFile {
+        AudioFile {
+            file_path: path.to_string(),
+            total_samples: 1,
+            sample_rate: 44100,
+            bit_depth: 16,
+            channels: 2,
+            peak_level: 0.5,
+            rms_db_level: -12.0,
+            file_size,
+            modified_secs: 0,
+        }
+    }
+
+    #[test]
+    fn du_sizes_sum_printed_duplicate_files() {
+        let a = audio_file("/music/a.flac", 60_000_000);
+        let b = audio_file("/music/b.flac", 60_000_000);
+        let c = audio_file("/music/c.flac", 1_200_000_000);
+        let group_one = DuplicateGroup {
+            id: "one".to_string(),
+            signature: DuplicateSignature::from_audio_file(&a),
+            files: vec![&a, &b],
+        };
+        let group_two = DuplicateGroup {
+            id: "two".to_string(),
+            signature: DuplicateSignature::from_audio_file(&c),
+            files: vec![&c],
+        };
+
+        assert_eq!(duplicate_group_size(&group_one), 120_000_000);
+        assert_eq!(total_duplicate_size(&[group_one, group_two]), 1_320_000_000);
+    }
+
+    #[test]
+    fn du_formatter_uses_compact_decimal_units() {
+        assert_eq!(format_du_bytes(999), "999B");
+        assert_eq!(format_du_bytes(120_000_000), "120MB");
+        assert_eq!(format_du_bytes(1_320_000_000), "1.32GB");
+    }
 }

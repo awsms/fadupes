@@ -83,6 +83,11 @@ Without `-i`, query options read the global resume state.
   * Query duplicate groups with at least one file path matching this case-insensitive regex
   * Returns whole duplicate groups, not only the matching file
 
+* `--du`
+
+  * Print summed duplicate file sizes in text output
+  * Adds `=> SIZE` after each duplicate group and a `Total size: SIZE` footer
+
 ### Optional
 
 * `--nolist`
