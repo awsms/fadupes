@@ -889,6 +889,10 @@ impl AudioFile {
                 }
 
                 let size = metadata.len();
+                if size == 0 {
+                    return None;
+                }
+
                 // Apply optional ignore filter from --ignore-size
                 if ignore_size.is_some_and(|flt| flt.should_ignore(size)) {
                     return None;
@@ -1439,6 +1443,43 @@ mod tests {
                 )
                 .is_none()
         );
+
+        std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn walk_dir_ignores_empty_audio_files_before_cache_lookup() {
+        let temp_dir = test_temp_dir("empty-audio");
+        let audio_path = temp_dir.join("empty.flac");
+        std::fs::write(&audio_path, []).unwrap();
+
+        let metadata = std::fs::metadata(&audio_path).unwrap();
+        let modified_secs = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let cache = Arc::new(ResumeCache::load(temp_dir.join("state.mdb"), 250));
+        let mut cached_audio = sample_audio_file();
+        cached_audio.file_path = audio_path.to_string_lossy().to_string();
+        cached_audio.file_size = 0;
+        cached_audio.modified_secs = modified_secs;
+        cache.store(cached_audio, 0, modified_secs);
+
+        let files = AudioFile::walk_dir(
+            &temp_dir,
+            &HashSet::from([temp_dir.clone()]),
+            false,
+            false,
+            true,
+            Some(cache),
+            None,
+            SeenFiles::new(),
+        );
+
+        assert!(files.is_empty());
 
         std::fs::remove_dir_all(temp_dir).unwrap();
     }
