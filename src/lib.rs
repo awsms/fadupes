@@ -326,6 +326,13 @@ impl SeenFiles {
     }
 }
 
+fn symlink_target_is_inside_scanned_input(
+    symlink_target: &Path,
+    scanned_dirs: &HashSet<PathBuf>,
+) -> bool {
+    scanned_dirs.iter().any(|root| symlink_target.starts_with(root))
+}
+
 type StateDb = Database<Str, SerdeJson<CachedEntry>>;
 pub type StateResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -842,29 +849,31 @@ impl AudioFile {
             .follow_links(!ignore_symlinks) // Follow symlinks by default; skip loop-back symlinks into input roots (and skip all symlinks if --nosym is set)
             .sort_by_file_name()
             .into_iter()
+            .filter_entry(|entry| {
+                if !entry.path_is_symlink() {
+                    return true;
+                }
+
+                if ignore_symlinks {
+                    return false;
+                }
+
+                if let Ok(symlink_target) =
+                    std::fs::canonicalize(entry.path()).or_else(|_| read_link(entry.path()))
+                    && symlink_target_is_inside_scanned_input(&symlink_target, scanned_dirs)
+                {
+                    eprintln!(
+                        "Skipping symlink pointing inside a scanned input: {}",
+                        entry.path().display()
+                    );
+                    return false;
+                }
+
+                true
+            })
             .filter_map(|e| e.ok())
             .filter_map(|f| {
                 let path = f.path();
-
-                if f.path_is_symlink() {
-                    if ignore_symlinks {
-                        return None;
-                    }
-
-                    // Check if it's a symlink and resolve it
-                    if let Ok(symlink_target) =
-                        std::fs::canonicalize(path).or_else(|_| read_link(path))
-                    {
-                        // If symlink points directly to one of the scan roots, ignore it
-                        if scanned_dirs.contains(&symlink_target) {
-                            eprintln!(
-                                "Skipping symlink pointing to a scanned input: {}",
-                                path.display()
-                            );
-                            return None;
-                        }
-                    }
-                }
 
                 let file_path = if f.path_is_symlink() {
                     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
@@ -1516,6 +1525,26 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&state_path).unwrap(), "{not-json");
 
         std::fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn symlink_targets_inside_scanned_inputs_are_skipped() {
+        let root = PathBuf::from("/music/flac");
+        let mut scanned_dirs = HashSet::new();
+        scanned_dirs.insert(root.clone());
+
+        assert!(symlink_target_is_inside_scanned_input(
+            &root.join("OK"),
+            &scanned_dirs
+        ));
+        assert!(symlink_target_is_inside_scanned_input(
+            &root,
+            &scanned_dirs
+        ));
+        assert!(!symlink_target_is_inside_scanned_input(
+            Path::new("/mnt/archive/OK"),
+            &scanned_dirs
+        ));
     }
 
     #[test]

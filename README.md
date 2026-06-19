@@ -166,7 +166,7 @@ Without `-i`, query options read the global resume state.
 
 By default, `fadupes` follows symlinks. When a symlink resolves to an audio file, the resolved target path is stored and reported instead of the symlink path.
 
-During a scan, `fadupes` tracks physical files it has already seen. On Unix this uses `(device, inode)`, so hardlinks and multiple symlinks to the same file are not decoded twice. On other platforms, canonical paths are used as the fallback identity.
+During a scan, `fadupes` tracks physical files it has already seen. On Unix this uses `(device, inode)`, so hardlinks and multiple symlinks to the same file are not decoded twice. On other platforms, canonical paths are used as the fallback identity. Symlinks that point back inside an input being scanned are skipped so the real input path is retained.
 
 Use `--nosym` to ignore symlinks completely.
 
